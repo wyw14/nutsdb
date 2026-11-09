@@ -207,3 +207,12 @@ func (s *Service) DeregisterKeyFromActiveExpiration(bucketId uint64, key []byte)
 		s.wheelManager.DeregisterKey(bucketId, key)
 	}
 }
+
+// GetTimingWheelMetrics returns the current metrics of the timing wheel.
+// Zero-valued metrics are returned when the timing wheel is disabled.
+func (s *Service) GetTimingWheelMetrics() TimingWheelMetrics {
+	if s.wheelManager == nil {
+		return TimingWheelMetrics{}
+	}
+	return s.wheelManager.GetMetrics()
+}

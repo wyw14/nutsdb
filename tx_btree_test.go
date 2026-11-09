@@ -3638,3 +3638,722 @@ func TestTx_TTL_LazyDeletionFromIndex(t *testing.T) {
 		})
 	})
 }
+
+// txExpire runs Tx.Expire inside a managed write transaction and checks the
+// returned updated flag and error.
+func txExpire(t *testing.T, db *DB, bucket string, key []byte, ttlSeconds int64, opts ExpireOptions, expectUpdated bool, expectErr error) {
+	err := db.Update(func(tx *Tx) error {
+		updated, err := tx.Expire(bucket, key, ttlSeconds, opts)
+		AssertErr(t, err, expectErr)
+		if expectErr == nil {
+			require.Equal(t, expectUpdated, updated)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+// openExpireTestDB opens a DB driven by a controllable mock clock. The clock
+// instance is returned so the caller can reattach it after a reopen.
+func openExpireTestDB(t *testing.T, opts *Options) (*DB, ttl.Clock) {
+	t.Helper()
+	mc := ttl.NewMockClock(time.Now().UnixMilli())
+	if opts == nil {
+		o := DefaultOptions
+		opts = &o
+	}
+	if opts.Dir == "" {
+		opts.Dir = filepath.Join(t.TempDir(), "nutsdb-expire-test")
+	}
+	opts.TTLConfig.EnableTimingWheel = false
+	db, err := Open(*opts)
+	require.NoError(t, err)
+	db.ttlService.SetClock(mc)
+	return db, mc
+}
+
+// findBTreeRecord reads the raw committed record for assertions without
+// triggering lazy expiration.
+func findBTreeRecord(t *testing.T, db *DB, bucket string, key []byte) *core.Record {
+	t.Helper()
+	b, err := db.bucketMgr.GetBucket(DataStructureBTree, bucket)
+	require.NoError(t, err)
+	idx, ok := db.Index.BTree.exist(b.Id)
+	require.True(t, ok)
+	record, found := idx.FindForVerification(key)
+	require.True(t, found)
+	require.NotNil(t, record)
+	return record
+}
+
+// TestTx_Expire_ValidationErrors verifies that illegal option combinations,
+// out-of-range seconds, read-only transactions and missing buckets are all
+// rejected before any state is modified.
+func TestTx_Expire_ValidationErrors(t *testing.T) {
+	bucket := "bucket"
+	key := []byte("key")
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, key, []byte("v"), 10, nil, nil)
+
+		illegalOpts := []ExpireOptions{
+			{NX: true, XX: true},
+			{NX: true, GT: true},
+			{NX: true, LT: true},
+			{GT: true, LT: true},
+			{NX: true, XX: true, GT: true, LT: true},
+		}
+		for _, opts := range illegalOpts {
+			err := db.Update(func(tx *Tx) error {
+				updated, err := tx.Expire(bucket, key, 10, opts)
+				require.ErrorIs(t, err, ErrInvalidExpireOptions)
+				require.False(t, updated)
+				require.Zero(t, tx.pendingWrites.size)
+				require.Zero(t, tx.size)
+				return nil
+			})
+			require.NoError(t, err)
+		}
+
+		// Seconds outside the uint32 storage range are rejected.
+		err := db.Update(func(tx *Tx) error {
+			updated, err := tx.Expire(bucket, key, int64(math.MaxUint32)+1, ExpireOptions{})
+			require.ErrorIs(t, err, ErrTTLOutOfRange)
+			require.False(t, updated)
+			require.Zero(t, tx.pendingWrites.size)
+			return nil
+		})
+		require.NoError(t, err)
+
+		// Read-only transactions cannot expire keys.
+		err = db.View(func(tx *Tx) error {
+			updated, err := tx.Expire(bucket, key, 10, ExpireOptions{})
+			require.ErrorIs(t, err, ErrTxNotWritable)
+			require.False(t, updated)
+			return nil
+		})
+		require.NoError(t, err)
+
+		// A missing bucket is reported.
+		err = db.Update(func(tx *Tx) error {
+			_, err := tx.Expire("no-such-bucket", key, 10, ExpireOptions{})
+			require.ErrorIs(t, err, ErrNotFoundBucket)
+			return nil
+		})
+		require.NoError(t, err)
+
+		// The original record is untouched after all the rejected calls.
+		record := findBTreeRecord(t, db, bucket, key)
+		require.Equal(t, uint32(10), record.TTL)
+		_ = mc
+	})
+}
+
+// TestTx_Expire_ConditionCombinations exercises every legal flag combination
+// against both persistent keys and keys with a finite deadline.
+func TestTx_Expire_ConditionCombinations(t *testing.T) {
+	bucket := "bucket"
+	value := []byte("value")
+
+	type expireCase struct {
+		name      string
+		persist   bool
+		ttlSecond int64
+		opts      ExpireOptions
+		want      bool
+	}
+
+	cases := []expireCase{
+		// Persistent key (old deadline is +infinity).
+		{name: "persistent plain", persist: true, ttlSecond: 5, opts: ExpireOptions{}, want: true},
+		{name: "persistent NX", persist: true, ttlSecond: 5, opts: ExpireOptions{NX: true}, want: true},
+		{name: "persistent XX rejected", persist: true, ttlSecond: 5, opts: ExpireOptions{XX: true}, want: false},
+		{name: "persistent GT rejected", persist: true, ttlSecond: 5, opts: ExpireOptions{GT: true}, want: false},
+		{name: "persistent LT accepted", persist: true, ttlSecond: 5, opts: ExpireOptions{LT: true}, want: true},
+		{name: "persistent XX GT rejected", persist: true, ttlSecond: 5, opts: ExpireOptions{XX: true, GT: true}, want: false},
+		{name: "persistent XX LT rejected", persist: true, ttlSecond: 5, opts: ExpireOptions{XX: true, LT: true}, want: false},
+
+		// Finite key created with TTL 10s; new TTL 20s extends, 5s shrinks.
+		{name: "finite plain extend", ttlSecond: 20, opts: ExpireOptions{}, want: true},
+		{name: "finite NX rejected", ttlSecond: 20, opts: ExpireOptions{NX: true}, want: false},
+		{name: "finite XX accepted", ttlSecond: 20, opts: ExpireOptions{XX: true}, want: true},
+		{name: "finite GT extend accepted", ttlSecond: 20, opts: ExpireOptions{GT: true}, want: true},
+		{name: "finite GT shrink rejected", ttlSecond: 5, opts: ExpireOptions{GT: true}, want: false},
+		{name: "finite LT shrink accepted", ttlSecond: 5, opts: ExpireOptions{LT: true}, want: true},
+		{name: "finite LT extend rejected", ttlSecond: 20, opts: ExpireOptions{LT: true}, want: false},
+		{name: "finite XX GT extend accepted", ttlSecond: 20, opts: ExpireOptions{XX: true, GT: true}, want: true},
+		{name: "finite XX GT shrink rejected", ttlSecond: 5, opts: ExpireOptions{XX: true, GT: true}, want: false},
+		{name: "finite XX LT shrink accepted", ttlSecond: 5, opts: ExpireOptions{XX: true, LT: true}, want: true},
+		{name: "finite XX LT extend rejected", ttlSecond: 20, opts: ExpireOptions{XX: true, LT: true}, want: false},
+	}
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		for i, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				key := []byte(fmt.Sprintf("key-%d", i))
+				if c.persist {
+					txPut(t, db, bucket, key, value, Persistent, nil, nil)
+				} else {
+					txPut(t, db, bucket, key, value, 10, nil, nil)
+				}
+
+				txExpire(t, db, bucket, key, c.ttlSecond, c.opts, c.want, nil)
+
+				if !c.want {
+					// Failed condition: original state is preserved.
+					record := findBTreeRecord(t, db, bucket, key)
+					if c.persist {
+						require.Equal(t, Persistent, record.TTL)
+					} else {
+						require.Equal(t, uint32(10), record.TTL)
+					}
+					txGet(t, db, bucket, key, value, nil)
+					return
+				}
+
+				// Successful update keeps the value and stores the new TTL.
+				txGet(t, db, bucket, key, value, nil)
+				record := findBTreeRecord(t, db, bucket, key)
+				require.Equal(t, uint32(c.ttlSecond), record.TTL)
+				require.Equal(t, uint64(mc.NowMillis()), record.Timestamp)
+				require.Equal(t, value, record.Value)
+			})
+		}
+	})
+}
+
+// TestTx_Expire_EqualDeadline verifies strict GT/LT comparison when the new
+// absolute deadline equals the current one.
+func TestTx_Expire_EqualDeadline(t *testing.T) {
+	bucket := "bucket"
+	key := []byte("key")
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, key, []byte("v"), 10, nil, nil)
+
+		// The mock clock has not moved: ttl=10 reproduces the same deadline.
+		txExpire(t, db, bucket, key, 10, ExpireOptions{GT: true}, false, nil)
+		txExpire(t, db, bucket, key, 10, ExpireOptions{LT: true}, false, nil)
+		txExpire(t, db, bucket, key, 10, ExpireOptions{XX: true, GT: true}, false, nil)
+		txExpire(t, db, bucket, key, 10, ExpireOptions{XX: true, LT: true}, false, nil)
+
+		// Non-comparative conditions still match.
+		txExpire(t, db, bucket, key, 10, ExpireOptions{}, true, nil)
+		txExpire(t, db, bucket, key, 10, ExpireOptions{XX: true}, true, nil)
+
+		record := findBTreeRecord(t, db, bucket, key)
+		require.Equal(t, uint32(10), record.TTL)
+		_ = mc
+	})
+}
+
+// TestTx_Expire_SubSecondRemaining proves GT/LT use millisecond absolute
+// deadlines instead of the seconds-rounded GetTTL remainder.
+func TestTx_Expire_SubSecondRemaining(t *testing.T) {
+	bucket := "bucket"
+	key := []byte("key")
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		// Deadline is T0 + 1000ms.
+		txPut(t, db, bucket, key, []byte("v"), 1, nil, nil)
+
+		// Only 500ms remain: GetTTL floors this to zero.
+		mc.AdvanceTime(500 * time.Millisecond)
+		err := db.View(func(tx *Tx) error {
+			remaining, err := tx.GetTTL(bucket, key)
+			r.NoError(err)
+			r.Equal(int64(0), remaining)
+			return nil
+		})
+		r.NoError(err)
+
+		// GT must still pass: the new deadline (T0+1500ms) is later than the
+		// old one (T0+1000ms) even though only <1 second remains.
+		txExpire(t, db, bucket, key, 1, ExpireOptions{GT: true}, true, nil)
+
+		record := findBTreeRecord(t, db, bucket, key)
+		r.Equal(uint32(1), record.TTL)
+		r.Equal(uint64(mc.NowMillis()), record.Timestamp)
+
+		// LT with a positive TTL cannot shrink below a sub-second deadline.
+		txExpire(t, db, bucket, key, 1, ExpireOptions{LT: true}, false, nil)
+
+		// Liveness follows the new deadline, not the old one.
+		mc.AdvanceTime(900 * time.Millisecond)
+		txGet(t, db, bucket, key, []byte("v"), nil)
+		mc.AdvanceTime(200 * time.Millisecond)
+		txGet(t, db, bucket, key, nil, ErrKeyNotFound)
+	})
+}
+
+// TestTx_Expire_SameTxVisibility verifies that later operations in the same
+// transaction observe the new TTL state while the original value is retained.
+func TestTx_Expire_SameTxVisibility(t *testing.T) {
+	bucket := "bucket"
+	key := []byte("key")
+	value := []byte("keep-me")
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		err := db.Update(func(tx *Tx) error {
+			r.NoError(tx.Put(bucket, key, value, 10))
+
+			updated, err := tx.Expire(bucket, key, 20, ExpireOptions{})
+			r.NoError(err)
+			r.True(updated)
+
+			// Read-your-writes: value bytes are preserved.
+			got, err := tx.Get(bucket, key)
+			r.NoError(err)
+			r.Equal(value, got)
+
+			// Read-your-writes: GetTTL reflects the new TTL.
+			remaining, err := tx.GetTTL(bucket, key)
+			r.NoError(err)
+			r.GreaterOrEqual(remaining, int64(19))
+			r.LessOrEqual(remaining, int64(20))
+
+			pending, err := tx.pendingWrites.Get(DataStructureBTree, bucket, key)
+			r.NoError(err)
+			r.Equal(DataSetFlag, pending.Meta.Flag)
+			r.Equal(uint32(20), pending.Meta.TTL)
+			r.Greater(pending.Meta.TTL, uint32(0))
+
+			// The pending finite state drives further conditional updates.
+			updated, err = tx.Expire(bucket, key, 30, ExpireOptions{XX: true})
+			r.NoError(err)
+			r.True(updated)
+
+			updated, err = tx.Expire(bucket, key, 40, ExpireOptions{NX: true})
+			r.NoError(err)
+			r.False(updated)
+
+			pending, err = tx.pendingWrites.Get(DataStructureBTree, bucket, key)
+			r.NoError(err)
+			r.Equal(uint32(30), pending.Meta.TTL)
+			return nil
+		})
+		r.NoError(err)
+
+		record := findBTreeRecord(t, db, bucket, key)
+		r.Equal(uint32(30), record.TTL)
+		r.Equal(value, record.Value)
+		r.Equal(uint64(mc.NowMillis()), record.Timestamp)
+	})
+}
+
+// TestTx_Expire_PendingPersistAndDelete covers Put/Persist/Delete followed by
+// Expire inside the same transaction.
+func TestTx_Expire_PendingPersistAndDelete(t *testing.T) {
+	bucket := "bucket"
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		// Persist inside the tx turns the pending entry persistent.
+		err := db.Update(func(tx *Tx) error {
+			r.NoError(tx.Put(bucket, []byte("p"), []byte("v"), 10))
+			r.NoError(tx.Persist(bucket, []byte("p")))
+
+			updated, err := tx.Expire(bucket, []byte("p"), 5, ExpireOptions{XX: true})
+			r.NoError(err)
+			r.False(updated)
+
+			updated, err = tx.Expire(bucket, []byte("p"), 5, ExpireOptions{NX: true})
+			r.NoError(err)
+			r.True(updated)
+			return nil
+		})
+		r.NoError(err)
+		record := findBTreeRecord(t, db, bucket, []byte("p"))
+		r.Equal(uint32(5), record.TTL)
+
+		// A pending delete must not be overridden or resurrected.
+		err = db.Update(func(tx *Tx) error {
+			r.NoError(tx.Put(bucket, []byte("d"), []byte("v"), 10))
+			r.NoError(tx.Delete(bucket, []byte("d")))
+
+			sizeBefore := tx.pendingWrites.size
+			updated, err := tx.Expire(bucket, []byte("d"), 10, ExpireOptions{})
+			r.NoError(err)
+			r.False(updated)
+			// The failed call added no pending entry.
+			r.Equal(sizeBefore, tx.pendingWrites.size)
+
+			_, err = tx.Get(bucket, []byte("d"))
+			r.ErrorIs(err, ErrKeyNotFound)
+			return nil
+		})
+		r.NoError(err)
+		txGet(t, db, bucket, []byte("d"), nil, ErrKeyNotFound)
+		_ = mc
+	})
+}
+
+// TestTx_Expire_NonPositiveTTL deletes the key when the condition matches and
+// never encodes Persistent (TTL=0) as a DataSetFlag entry.
+func TestTx_Expire_NonPositiveTTL(t *testing.T) {
+	bucket := "bucket"
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		txPut(t, db, bucket, []byte("finite"), []byte("v"), 10, nil, nil)
+		txPut(t, db, bucket, []byte("persist"), []byte("v"), Persistent, nil, nil)
+
+		// ttl=0 on a matching condition deletes the key.
+		txExpire(t, db, bucket, []byte("finite"), 0, ExpireOptions{}, true, nil)
+		txGet(t, db, bucket, []byte("finite"), nil, ErrKeyNotFound)
+
+		// Negative seconds behave the same, here combined with NX.
+		txExpire(t, db, bucket, []byte("persist"), -5, ExpireOptions{NX: true}, true, nil)
+		txGet(t, db, bucket, []byte("persist"), nil, ErrKeyNotFound)
+
+		// A failing condition with ttl=0 leaves the key untouched.
+		txPut(t, db, bucket, []byte("guarded"), []byte("v"), 10, nil, nil)
+		txExpire(t, db, bucket, []byte("guarded"), 0, ExpireOptions{GT: true}, false, nil)
+		txGet(t, db, bucket, []byte("guarded"), []byte("v"), nil)
+		record := findBTreeRecord(t, db, bucket, []byte("guarded"))
+		r.Equal(uint32(10), record.TTL)
+
+		// A successful positive update is a real DataSetFlag with TTL > 0,
+		// never the Persistent encoding.
+		err := db.Update(func(tx *Tx) error {
+			updated, err := tx.Expire(bucket, []byte("guarded"), 8, ExpireOptions{})
+			r.NoError(err)
+			r.True(updated)
+			pending, err := tx.pendingWrites.Get(DataStructureBTree, bucket, []byte("guarded"))
+			r.NoError(err)
+			r.Equal(DataSetFlag, pending.Meta.Flag)
+			r.Equal(uint32(8), pending.Meta.TTL)
+			return nil
+		})
+		r.NoError(err)
+		_ = mc
+	})
+}
+
+// TestTx_Expire_MissingAndExpired verifies that absent or expired keys are
+// reported as not updated without producing writes, and that a failed call
+// does not prevent the rest of the transaction from committing.
+func TestTx_Expire_MissingAndExpired(t *testing.T) {
+	bucket := "bucket"
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		// Missing key: no write, no pending growth.
+		err := db.Update(func(tx *Tx) error {
+			updated, err := tx.Expire(bucket, []byte("missing"), 10, ExpireOptions{})
+			r.NoError(err)
+			r.False(updated)
+			r.Zero(tx.pendingWrites.size)
+			r.Zero(tx.size)
+			return nil
+		})
+		r.NoError(err)
+
+		// Expired committed key must not be resurrected by Expire.
+		txPut(t, db, bucket, []byte("stale"), []byte("old"), 1, nil, nil)
+		mc.AdvanceTime(1100 * time.Millisecond)
+
+		txExpire(t, db, bucket, []byte("stale"), 100, ExpireOptions{}, false, nil)
+		txGet(t, db, bucket, []byte("stale"), nil, ErrKeyNotFound)
+
+		// The stale index record is still physically present (lazy deletion
+		// has not run) yet Expire refused to overwrite it.
+		b, err := db.bucketMgr.GetBucket(DataStructureBTree, bucket)
+		r.NoError(err)
+		idx, ok := db.Index.BTree.exist(b.Id)
+		r.True(ok)
+		_, found := idx.FindForVerification([]byte("stale"))
+		r.True(found)
+
+		// A failed Expire followed by other work still commits cleanly.
+		err = db.Update(func(tx *Tx) error {
+			updated, err := tx.Expire(bucket, []byte("stale"), 100, ExpireOptions{XX: true})
+			r.NoError(err)
+			r.False(updated)
+			r.NoError(tx.Put(bucket, []byte("fresh"), []byte("new"), 10))
+			r.Equal(1, tx.pendingWrites.size)
+			return nil
+		})
+		r.NoError(err)
+		txGet(t, db, bucket, []byte("fresh"), []byte("new"), nil)
+		txGet(t, db, bucket, []byte("stale"), nil, ErrKeyNotFound)
+	})
+}
+
+// TestTx_Expire_ClockLiveness drives the mock clock across the deadlines
+// chosen by Expire without sleeping across second boundaries.
+func TestTx_Expire_ClockLiveness(t *testing.T) {
+	bucket := "bucket"
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		txPut(t, db, bucket, []byte("k1"), []byte("v1"), 10, nil, nil)
+		txPut(t, db, bucket, []byte("k2"), []byte("v2"), 10, nil, nil)
+
+		// k1: extend to 30s.
+		txExpire(t, db, bucket, []byte("k1"), 30, ExpireOptions{}, true, nil)
+		k1ExpireAt := uint64(mc.NowMillis())
+		// k2: after 5s, shrink to 3s (new deadline T0+8s, old was T0+10s).
+		mc.AdvanceTime(5 * time.Second)
+		txExpire(t, db, bucket, []byte("k2"), 3, ExpireOptions{LT: true}, true, nil)
+
+		r.Equal(k1ExpireAt, findBTreeRecord(t, db, bucket, []byte("k1")).Timestamp)
+
+		// At T0+7s both are alive.
+		mc.AdvanceTime(2 * time.Second)
+		txGet(t, db, bucket, []byte("k1"), []byte("v1"), nil)
+		txGet(t, db, bucket, []byte("k2"), []byte("v2"), nil)
+
+		// At T0+9s k2 (deadline T0+8s) is gone, k1 (deadline T0+30s) stays.
+		mc.AdvanceTime(2 * time.Second)
+		txGet(t, db, bucket, []byte("k2"), nil, ErrKeyNotFound)
+		txGet(t, db, bucket, []byte("k1"), []byte("v1"), nil)
+
+		// At T0+31s k1 expires as well.
+		mc.AdvanceTime(22 * time.Second)
+		txGet(t, db, bucket, []byte("k1"), nil, ErrKeyNotFound)
+	})
+}
+
+// TestTx_Expire_CommitAndReopen checks real on-disk survival, including
+// Expire-driven deletes, after closing and reopening the database while the
+// same controllable clock is reattached.
+func TestTx_Expire_CommitAndReopen(t *testing.T) {
+	r := require.New(t)
+	dir := filepath.Join(t.TempDir(), "nutsdb-expire-reopen")
+	opts := DefaultOptions
+	opts.Dir = dir
+	opts.TTLConfig.EnableTimingWheel = false
+	mc := ttl.NewMockClock(time.Now().UnixMilli())
+
+	db, err := Open(opts)
+	r.NoError(err)
+	db.ttlService.SetClock(mc)
+	txCreateBucket(t, db, DataStructureBTree, "bucket", nil)
+
+	txPut(t, db, "bucket", []byte("keep"), []byte("v1"), Persistent, nil, nil)
+	txPut(t, db, "bucket", []byte("gone"), []byte("v2"), 10, nil, nil)
+
+	txExpire(t, db, "bucket", []byte("keep"), 100, ExpireOptions{NX: true}, true, nil)
+	txExpire(t, db, "bucket", []byte("gone"), 0, ExpireOptions{}, true, nil)
+
+	r.NoError(db.Close())
+
+	// Reopen and reattach the same mock clock.
+	db2, err := Open(opts)
+	r.NoError(err)
+	db2.ttlService.SetClock(mc)
+
+	txGet(t, db2, "bucket", []byte("keep"), []byte("v1"), nil)
+	err = db2.View(func(tx *Tx) error {
+		remaining, err := tx.GetTTL("bucket", []byte("keep"))
+		r.NoError(err)
+		r.Equal(int64(100), remaining)
+		return nil
+	})
+	r.NoError(err)
+	txGet(t, db2, "bucket", []byte("gone"), nil, ErrKeyNotFound)
+
+	// The recovered TTL still expires under clock control.
+	mc.AdvanceTime(101 * time.Second)
+	txGet(t, db2, "bucket", []byte("keep"), nil, ErrKeyNotFound)
+
+	r.NoError(db2.Close())
+}
+
+// TestTx_Expire_NoSideEffectsOnFailure ensures failed conditions do not touch
+// the pending list or tx size, while successful ones do.
+func TestTx_Expire_NoSideEffectsOnFailure(t *testing.T) {
+	bucket := "bucket"
+
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("finite"), []byte("v"), 10, nil, nil)
+		txPut(t, db, bucket, []byte("persist"), []byte("v"), Persistent, nil, nil)
+
+		err := db.Update(func(tx *Tx) error {
+			r.Zero(tx.pendingWrites.size)
+			r.Zero(tx.size)
+
+			// NX on a finite key fails.
+			updated, err := tx.Expire(bucket, []byte("finite"), 5, ExpireOptions{NX: true})
+			r.NoError(err)
+			r.False(updated)
+			r.Zero(tx.pendingWrites.size)
+			r.Zero(tx.size)
+
+			// XX on a persistent key fails.
+			updated, err = tx.Expire(bucket, []byte("persist"), 5, ExpireOptions{XX: true})
+			r.NoError(err)
+			r.False(updated)
+			r.Zero(tx.pendingWrites.size)
+			r.Zero(tx.size)
+
+			// GT with a shorter deadline fails.
+			updated, err = tx.Expire(bucket, []byte("finite"), 5, ExpireOptions{GT: true})
+			r.NoError(err)
+			r.False(updated)
+			r.Zero(tx.pendingWrites.size)
+			r.Zero(tx.size)
+
+			// A successful call finally creates pending state.
+			updated, err = tx.Expire(bucket, []byte("finite"), 20, ExpireOptions{GT: true})
+			r.NoError(err)
+			r.True(updated)
+			r.Equal(1, tx.pendingWrites.size)
+			r.Greater(tx.size, int64(0))
+
+			// Another failed call leaves the existing pending state untouched.
+			sizeBefore := tx.size
+			updated, err = tx.Expire(bucket, []byte("finite"), 1, ExpireOptions{NX: true})
+			r.NoError(err)
+			r.False(updated)
+			r.Equal(1, tx.pendingWrites.size)
+			r.Equal(sizeBefore, tx.size)
+			return nil
+		})
+		r.NoError(err)
+		_ = mc
+	})
+}
+
+// TestTx_Expire_ActiveExpirationRegistration verifies timing-wheel
+// registration counts only change on successful commits.
+func TestTx_Expire_ActiveExpirationRegistration(t *testing.T) {
+	r := require.New(t)
+	opts := DefaultOptions
+	opts.Dir = filepath.Join(t.TempDir(), "nutsdb-expire-wheel")
+	opts.TTLConfig.EnableTimingWheel = true
+	opts.TTLConfig.WheelSlotDuration = time.Second
+	opts.TTLConfig.WheelSize = 3600
+	mc := ttl.NewMockClock(time.Now().UnixMilli())
+
+	db, err := Open(opts)
+	r.NoError(err)
+	db.ttlService.SetClock(mc)
+	txCreateBucket(t, db, DataStructureBTree, "bucket", nil)
+
+	// Persistent writes register nothing.
+	txPut(t, db, "bucket", []byte("k"), []byte("v"), Persistent, nil, nil)
+	r.Equal(int64(0), db.ttlService.GetTimingWheelMetrics().RegisteredKeys)
+
+	// Failing conditions register nothing.
+	txExpire(t, db, "bucket", []byte("k"), 3600, ExpireOptions{XX: true}, false, nil)
+	r.Equal(int64(0), db.ttlService.GetTimingWheelMetrics().RegisteredKeys)
+
+	// Successful TTL update registers the key.
+	txExpire(t, db, "bucket", []byte("k"), 3600, ExpireOptions{NX: true}, true, nil)
+	r.Equal(int64(1), db.ttlService.GetTimingWheelMetrics().RegisteredKeys)
+
+	// Another failing condition changes nothing.
+	txExpire(t, db, "bucket", []byte("k"), 10, ExpireOptions{GT: true}, false, nil)
+	r.Equal(int64(1), db.ttlService.GetTimingWheelMetrics().RegisteredKeys)
+
+	// Expire-driven delete deregisters the key.
+	txExpire(t, db, "bucket", []byte("k"), 0, ExpireOptions{LT: true}, true, nil)
+	r.Equal(int64(0), db.ttlService.GetTimingWheelMetrics().RegisteredKeys)
+
+	r.NoError(db.Close())
+}
+
+// TestTx_Expire_WatchNotifications verifies that failed Expire calls emit no
+// watch messages while successful updates and deletes do.
+func TestTx_Expire_WatchNotifications(t *testing.T) {
+	r := require.New(t)
+	opts := DefaultOptions
+	opts.Dir = filepath.Join(t.TempDir(), "nutsdb-expire-watch")
+	opts.EnableWatch = true
+	opts.TTLConfig.EnableTimingWheel = false
+	db, mc := openExpireTestDB(t, &opts)
+
+	txCreateBucket(t, db, DataStructureBTree, "bucket", nil)
+
+	// Subscribe before writing so every delivery is accounted for.
+	sub, err := db.watchMgr.subscribe("bucket", "k")
+	r.NoError(err)
+	txPut(t, db, "bucket", []byte("k"), []byte("v"), Persistent, nil, nil)
+	select {
+	case msg := <-sub.receiveChan:
+		r.Equal(DataFlag(DataSetFlag), msg.Flag)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for initial Put watch message")
+	}
+
+	// Failing condition: the transaction commits no entries, so no message.
+	txExpire(t, db, "bucket", []byte("k"), 100, ExpireOptions{XX: true}, false, nil)
+	select {
+	case msg := <-sub.receiveChan:
+		t.Fatalf("unexpected watch message after failed Expire: %+v", msg)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Successful update delivers a DataSetFlag message.
+	txExpire(t, db, "bucket", []byte("k"), 100, ExpireOptions{NX: true}, true, nil)
+	select {
+	case msg := <-sub.receiveChan:
+		r.Equal("bucket", msg.BucketName)
+		r.Equal("k", msg.Key)
+		r.Equal(DataFlag(DataSetFlag), msg.Flag)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for Expire update watch message")
+	}
+
+	// Expire-driven delete delivers a DataDeleteFlag message.
+	txExpire(t, db, "bucket", []byte("k"), 0, ExpireOptions{}, true, nil)
+	select {
+	case msg := <-sub.receiveChan:
+		r.Equal(DataFlag(DataDeleteFlag), msg.Flag)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for Expire delete watch message")
+	}
+
+	r.NoError(db.Close())
+	_ = mc
+}
+
+// TestTx_Expire_IndexModes runs the value-preservation path under both index
+// modes, including the disk-read path of HintKeyAndRAMIdxMode.
+func TestTx_Expire_IndexModes(t *testing.T) {
+	bucket := "bucket"
+	key := []byte("key")
+	value := []byte("preserve-this-value")
+
+	for _, mode := range []EntryIdxMode{HintKeyValAndRAMIdxMode, HintKeyAndRAMIdxMode} {
+		t.Run(fmt.Sprintf("mode-%d", mode), func(t *testing.T) {
+			opts := DefaultOptions
+			opts.Dir = filepath.Join(t.TempDir(), fmt.Sprintf("nutsdb-expire-mode-%d", mode))
+			opts.EntryIdxMode = mode
+			db, mc := openExpireTestDB(t, &opts)
+
+			txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+			txPut(t, db, bucket, key, value, 10, nil, nil)
+
+			txExpire(t, db, bucket, key, 20, ExpireOptions{}, true, nil)
+
+			txGet(t, db, bucket, key, value, nil)
+			record := findBTreeRecord(t, db, bucket, key)
+			require.Equal(t, uint32(20), record.TTL)
+			require.Equal(t, uint64(mc.NowMillis()), record.Timestamp)
+
+			require.NoError(t, db.Close())
+		})
+	}
+}

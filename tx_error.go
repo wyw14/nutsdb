@@ -63,4 +63,13 @@ var (
 	ErrStartGreaterThanEnd = errors.New("start is greater than end")
 
 	ErrInvalidKey = errors.New("invalid key")
+
+	// ErrInvalidExpireOptions is returned when the condition flags passed to
+	// Tx.Expire cannot be combined (for example NX together with XX/GT/LT, or
+	// GT together with LT).
+	ErrInvalidExpireOptions = errors.New("invalid expire options")
+
+	// ErrTTLOutOfRange is returned when the relative TTL seconds passed to
+	// Tx.Expire cannot be stored in the on-disk uint32 TTL field.
+	ErrTTLOutOfRange = errors.New("ttl exceeds the storable second range")
 )

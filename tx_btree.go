@@ -678,6 +678,157 @@ func (tx *Tx) Persist(bucket string, key []byte) error {
 	})
 }
 
+// ExpireOptions holds the optional condition flags used by Tx.Expire.
+type ExpireOptions struct {
+	// NX applies the new TTL only when the key has no expiration (persistent).
+	NX bool
+	// XX applies the new TTL only when the key already has an expiration.
+	XX bool
+	// GT applies the new TTL only when the new absolute deadline is greater
+	// than the current one. Persistent keys are treated as having an infinite
+	// deadline, so GT can never match them.
+	GT bool
+	// LT applies the new TTL only when the new absolute deadline is less than
+	// the current one. Persistent keys are treated as having an infinite
+	// deadline, so LT always matches them.
+	LT bool
+}
+
+// validate checks that the condition flags form a legal combination.
+// NX is mutually exclusive with XX, GT and LT; GT and LT are mutually
+// exclusive. XX may be combined with either GT or LT.
+func (opts ExpireOptions) validate() error {
+	if opts.NX && (opts.XX || opts.GT || opts.LT) {
+		return ErrInvalidExpireOptions
+	}
+	if opts.GT && opts.LT {
+		return ErrInvalidExpireOptions
+	}
+	return nil
+}
+
+// Expire updates the relative TTL (in seconds) of a BTree key and reports
+// whether an actual change was made.
+//
+// Condition flags (see ExpireOptions) are evaluated against the key's current
+// state inside this transaction: pending writes/deletes take precedence over
+// the committed index. A missing, pending-deleted or already expired key
+// matches no condition, so Expire returns false without writing anything and
+// never resurrects an expired value.
+//
+// GT/LT compare absolute deadlines in milliseconds: timestamp + ttl*1000.
+// Persistent keys participate as an infinite deadline. The TTL service clock
+// is read exactly once per call; that single instant drives both expiration
+// detection and the new deadline, so sub-second remainders are judged
+// correctly instead of relying on the seconds-rounded GetTTL result.
+//
+// When a condition matches and ttl is zero or negative, the key is deleted.
+// Positive ttl values keep the existing second-level storage format and the
+// original value bytes; only the TTL information is replaced.
+func (tx *Tx) Expire(bucket string, key []byte, ttl int64, opts ExpireOptions) (bool, error) {
+	// All validation happens before any state is modified.
+	if err := tx.checkTxIsClosed(); err != nil {
+		return false, err
+	}
+	if err := opts.validate(); err != nil {
+		return false, err
+	}
+	if ttl > math.MaxUint32 {
+		return false, ErrTTLOutOfRange
+	}
+	if !tx.writable {
+		return false, ErrTxNotWritable
+	}
+
+	status, b := tx.getBucketAndItsStatus(DataStructureBTree, bucket)
+	if isBucketNotFoundStatus(status) {
+		return false, ErrNotFoundBucket
+	}
+	bucketId := b.Id
+
+	// Single clock read for the whole operation: both expiration detection
+	// and the new deadline are derived from this instant.
+	now := tx.db.ttlService.NowMillis()
+
+	var (
+		oldValue     []byte
+		oldTTL       uint32
+		oldTimestamp uint64
+	)
+
+	// Pending writes/deletes in this transaction are checked first.
+	switch status, pendingEntry := tx.findEntryAndItsStatus(DataStructureBTree, bucket, string(key)); status {
+	case EntryDeleted:
+		// A pending delete must not be overridden by a stale committed record.
+		return false, nil
+	case EntryUpdated:
+		oldValue = pendingEntry.Value
+		oldTTL = pendingEntry.Meta.TTL
+		oldTimestamp = pendingEntry.Meta.Timestamp
+	default:
+		// Fall back to the committed index.
+		idx, ok := tx.db.Index.BTree.exist(bucketId)
+		if !ok {
+			return false, nil
+		}
+		// Read the raw record without triggering expiration side effects;
+		// expiration is decided against the single `now` snapshot.
+		record, found := idx.FindForVerification(key)
+		if !found {
+			return false, nil
+		}
+		if record.TTL != Persistent && now >= int64(record.Timestamp)+int64(record.TTL)*1000 {
+			// The committed value is already expired: do not resurrect it.
+			return false, nil
+		}
+		value, err := tx.db.getValueByRecord(record)
+		if err != nil {
+			return false, err
+		}
+		oldValue = value
+		oldTTL = record.TTL
+		oldTimestamp = record.Timestamp
+	}
+
+	persistent := oldTTL == Persistent
+
+	if opts.NX && !persistent {
+		return false, nil
+	}
+	if opts.XX && persistent {
+		return false, nil
+	}
+	if opts.GT || opts.LT {
+		// New absolute deadline computed from the single clock snapshot.
+		newDeadline := now + ttl*1000
+		// Persistent keys participate as an infinite deadline.
+		oldDeadline := int64(math.MaxInt64)
+		if !persistent {
+			oldDeadline = int64(oldTimestamp) + int64(oldTTL)*1000
+		}
+		if opts.GT && newDeadline <= oldDeadline {
+			return false, nil
+		}
+		if opts.LT && newDeadline >= oldDeadline {
+			return false, nil
+		}
+	}
+
+	// Condition matched. A non-positive TTL deletes the key.
+	if ttl <= 0 {
+		if err := tx.put(bucket, key, nil, Persistent, DataDeleteFlag, uint64(now), DataStructureBTree); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// Preserve the original value bytes and replace only the TTL information.
+	if err := tx.put(bucket, key, oldValue, uint32(ttl), DataSetFlag, uint64(now), DataStructureBTree); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (tx *Tx) MSet(bucket string, ttl uint32, args ...[]byte) error {
 	if len(args) == 0 {
 		return nil
