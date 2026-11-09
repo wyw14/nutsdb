@@ -38,22 +38,35 @@ const (
 // pendingBucketList the uncommitted bucket changes in this Tx
 type pendingBucketList map[core.Ds]map[core.BucketName]*core.Bucket
 
-// pendingEntriesInBTree means the changes Entries in DataStructureBTree in the Tx
+// pendingEntriesInBTree means the point changes (Put/Delete) Entries in
+// DataStructureBTree in the Tx, keyed by user key. Only the latest point
+// operation per key is retained, exactly like the historical behavior.
 type pendingEntriesInBTree map[core.BucketName]map[string]*core.Entry
 
 // pendingEntryList the uncommitted Entry changes in this Tx
 type pendingEntryList struct {
 	entriesInBTree pendingEntriesInBTree
-	entries        map[core.Ds]map[core.BucketName][]*core.Entry
-	size           int
+	// bTreeOps keeps every BTree operation (point operations and range
+	// deletes) in exact call order per bucket. Point entries share their
+	// pointers with entriesInBTree; superseded point entries stay in the log
+	// but are skipped when collecting the commit list. Range delete entries
+	// never enter the point map because they are not keyed user values.
+	bTreeOps map[core.BucketName][]*core.Entry
+	// rangeDeleteCount records the number of currently visible items removed
+	// by each range delete operation at the time it was issued.
+	rangeDeleteCount map[*core.Entry]int
+	entries          map[core.Ds]map[core.BucketName][]*core.Entry
+	size             int
 }
 
 // newPendingEntriesList create a new pendingEntryList object for a Tx
 func newPendingEntriesList() *pendingEntryList {
 	pending := &pendingEntryList{
-		entriesInBTree: map[core.BucketName]map[string]*core.Entry{},
-		entries:        map[core.Ds]map[core.BucketName][]*core.Entry{},
-		size:           0,
+		entriesInBTree:   map[core.BucketName]map[string]*core.Entry{},
+		bTreeOps:         map[core.BucketName][]*core.Entry{},
+		rangeDeleteCount: map[*core.Entry]int{},
+		entries:          map[core.Ds]map[core.BucketName][]*core.Entry{},
+		size:             0,
 	}
 	return pending
 }
@@ -69,6 +82,7 @@ func (pending *pendingEntryList) submitEntry(ds core.Ds, bucket string, e *core.
 			pending.size++
 		}
 		pending.entriesInBTree[bucket][string(e.Key)] = e
+		pending.bTreeOps[bucket] = append(pending.bTreeOps[bucket], e)
 	default:
 		if _, exist := pending.entries[ds]; !exist {
 			pending.entries[ds] = map[core.BucketName][]*core.Entry{}
@@ -78,6 +92,20 @@ func (pending *pendingEntryList) submitEntry(ds core.Ds, bucket string, e *core.
 		pending.entries[ds][bucket] = entries
 		pending.size++
 	}
+}
+
+// submitBTreeRangeEntry appends a BTree range delete entry to the ordered
+// operation log. Range deletes are never stored as point values.
+func (pending *pendingEntryList) submitBTreeRangeEntry(bucket string, e *core.Entry, deletedCount int) {
+	pending.bTreeOps[bucket] = append(pending.bTreeOps[bucket], e)
+	pending.rangeDeleteCount[e] = deletedCount
+	pending.size++
+}
+
+// getRangeDeleteCount returns the visible item count removed by the given
+// range delete entry when it was issued.
+func (pending *pendingEntryList) getRangeDeleteCount(e *core.Entry) int {
+	return pending.rangeDeleteCount[e]
 }
 
 func (pending *pendingEntryList) Get(ds core.Ds, bucket string, key []byte) (entry *core.Entry, err error) {
@@ -119,27 +147,119 @@ func (pending *pendingEntryList) GetTTL(ds core.Ds, bucket string, key []byte) (
 	return int64(expireTime(rec.Meta.Timestamp, rec.Meta.TTL).Seconds()), nil
 }
 
-func (pending *pendingEntryList) getDataByRange(
-	start, end []byte, bucketName core.BucketName,
-) (keys, values [][]byte) {
+// keyInHalfOpenRange reports whether key belongs to [start, end) under the
+// database key order (lexicographic byte order).
+func keyInHalfOpenRange(key, start, end []byte) bool {
+	return bytes.Compare(key, start) >= 0 && bytes.Compare(key, end) < 0
+}
 
-	mp, ok := pending.entriesInBTree[bucketName]
-	if !ok {
-		return nil, nil
+// keyInClosedRange reports whether key belongs to [start, end]. It preserves
+// the historical inclusive RangeScan boundary semantics.
+func keyInClosedRange(key, start, end []byte) bool {
+	return bytes.Compare(key, start) >= 0 && bytes.Compare(key, end) <= 0
+}
+
+// bTreePendingView is the effective BTree pending state of one bucket after
+// replaying its point and range operations in call order.
+type bTreePendingView struct {
+	// lastPoint holds the newest point operation per key that a later range
+	// delete has not shadowed. Delete-flag entries remain as tombstones.
+	lastPoint map[string]*core.Entry
+	// ranges holds the decoded [start, end) boundaries of all range deletes
+	// in call order.
+	ranges [][2][]byte
+}
+
+// buildBTreeView replays the ordered BTree operation log of one bucket.
+func (pending *pendingEntryList) buildBTreeView(bucket core.BucketName) *bTreePendingView {
+	view := &bTreePendingView{lastPoint: map[string]*core.Entry{}}
+
+	for _, op := range pending.bTreeOps[bucket] {
+		if op.Meta.Flag == DataDeleteRangeFlag {
+			start, end, err := op.DecodeRangeDelete()
+			if err != nil {
+				// Entries are validated on submission; never expect this.
+				continue
+			}
+			// A range delete shadows every earlier pending point in range.
+			for key := range view.lastPoint {
+				if keyInHalfOpenRange([]byte(key), start, end) {
+					delete(view.lastPoint, key)
+				}
+			}
+			view.ranges = append(view.ranges, [2][]byte{start, end})
+			continue
+		}
+		view.lastPoint[string(op.Key)] = op
 	}
+
+	return view
+}
+
+// status returns the effective pending status of one key.
+func (view *bTreePendingView) status(key []byte) (EntryStatus, *core.Entry) {
+	if entry, ok := view.lastPoint[string(key)]; ok {
+		if entry.Meta.Flag == DataDeleteFlag {
+			return EntryDeleted, nil
+		}
+		return EntryUpdated, entry
+	}
+
+	for _, boundaries := range view.ranges {
+		if keyInHalfOpenRange(key, boundaries[0], boundaries[1]) {
+			return EntryDeleted, nil
+		}
+	}
+
+	return NotFoundEntry, nil
+}
+
+// isRangeMasked reports whether an older index item for key must be hidden
+// because a pending range delete covers it (and no later point op revived it).
+func (view *bTreePendingView) isRangeMasked(key []byte) bool {
+	if _, ok := view.lastPoint[string(key)]; ok {
+		return false
+	}
+	for _, boundaries := range view.ranges {
+		if keyInHalfOpenRange(key, boundaries[0], boundaries[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// visiblePuts returns the effective pending point puts within the requested
+// boundaries, sorted by key. Tombstones and range-shadowed keys are excluded.
+func (view *bTreePendingView) visiblePuts(start, end []byte, inclusiveEnd bool) (keys, values [][]byte) {
+	inRange := keyInHalfOpenRange
+	if inclusiveEnd {
+		inRange = keyInClosedRange
+	}
+
 	keys = make([][]byte, 0)
 	values = make([][]byte, 0)
-	for _, v := range mp {
-		if bytes.Compare(start, v.Key) <= 0 && bytes.Compare(v.Key, end) <= 0 {
-			keys = append(keys, v.Key)
-			values = append(values, v.Value)
+	for _, entry := range view.lastPoint {
+		if entry.Meta.Flag == DataDeleteFlag {
+			continue
+		}
+		if inRange(entry.Key, start, end) {
+			keys = append(keys, entry.Key)
+			values = append(values, entry.Value)
 		}
 	}
 	sort.Sort(&sortkv{
 		k: keys,
 		v: values,
 	})
-	return
+	return keys, values
+}
+
+// bTreeStatus is a thin pending-side wrapper used by Tx helpers.
+func (pending *pendingEntryList) bTreeStatus(bucket core.BucketName, key []byte) (EntryStatus, *core.Entry) {
+	if len(pending.bTreeOps[bucket]) == 0 {
+		return NotFoundEntry, nil
+	}
+	return pending.buildBTreeView(bucket).status(key)
 }
 
 // rangeBucket input a range handler function f and call it with every bucket in pendingBucketList
@@ -156,11 +276,21 @@ func (p pendingBucketList) rangeBucket(f func(bucket *core.Bucket) error) error 
 }
 
 // toList collect all the entries in pendingEntryList to a list.
+// BTree entries are emitted per bucket in exact operation order: range
+// deletes keep their position, while superseded point entries are skipped and
+// only the latest point entry per key is emitted.
 func (pending *pendingEntryList) toList() []*core.Entry {
 	list := make([]*core.Entry, 0, pending.size)
-	for _, entriesInBucket := range pending.entriesInBTree {
-		for _, entry := range entriesInBucket {
-			list = append(list, entry)
+	for bucket, ops := range pending.bTreeOps {
+		latestPoints := pending.entriesInBTree[bucket]
+		for _, entry := range ops {
+			if entry.Meta.Flag == DataDeleteRangeFlag {
+				list = append(list, entry)
+				continue
+			}
+			if latestPoints[string(entry.Key)] == entry {
+				list = append(list, entry)
+			}
 		}
 	}
 	for _, entriesInDS := range pending.entries {
@@ -171,36 +301,24 @@ func (pending *pendingEntryList) toList() []*core.Entry {
 	return list
 }
 
-func (pending *pendingEntryList) rangeEntries(_ core.Ds, bucketName core.BucketName, rangeFunc func(entry *core.Entry) bool) {
-	pendingWriteEntries := pending.entriesInBTree
-	if pendingWriteEntries == nil {
-		return
-	}
-	entries := pendingWriteEntries[bucketName]
-	for _, entry := range entries {
-		ok := rangeFunc(entry)
-		if !ok {
-			break
-		}
-	}
-}
-
+// MaxOrMinKey returns the max/min key among the effective pending point puts
+// of a bucket. Keys shadowed by a later range delete are excluded.
 func (pending *pendingEntryList) MaxOrMinKey(bucketName string, isMax bool) (key []byte, found bool) {
-	var (
-		maxKey       []byte = nil
-		minKey       []byte = nil
-		pendingFound        = false
-	)
+	if len(pending.bTreeOps[bucketName]) == 0 {
+		return nil, false
+	}
 
-	pending.rangeEntries(
-		DataStructureBTree,
-		bucketName,
-		func(entry *core.Entry) bool {
-			maxKey = compareAndReturn(maxKey, entry.Key, 1)
-			minKey = compareAndReturn(minKey, entry.Key, -1)
-			pendingFound = true
-			return true
-		})
+	view := pending.buildBTreeView(bucketName)
+	var maxKey, minKey []byte
+	pendingFound := false
+	for _, entry := range view.lastPoint {
+		if entry.Meta.Flag == DataDeleteFlag {
+			continue
+		}
+		maxKey = compareAndReturn(maxKey, entry.Key, 1)
+		minKey = compareAndReturn(minKey, entry.Key, -1)
+		pendingFound = true
+	}
 
 	if !pendingFound {
 		return nil, false

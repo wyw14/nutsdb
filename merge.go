@@ -259,6 +259,16 @@ func (db *DB) buildHintFilesAfterMerge(startFileID, endFileID int64) error {
 				break
 			}
 
+			// Range delete tombstones are never rewritten during merge, so they
+			// must not reach hint files. Skip defensively to guarantee it.
+			if entry.Meta.Flag == DataDeleteRangeFlag {
+				off += entry.Size()
+				if off >= fr.size {
+					break
+				}
+				continue
+			}
+
 			hintEntry := newHintEntryFromEntry(entry, fileID, uint64(off))
 
 			if err := hintWriter.Write(hintEntry); err != nil {

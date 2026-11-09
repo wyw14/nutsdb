@@ -369,6 +369,10 @@ func (tx *Tx) getKvEntryNewAddRecordCount(bucketId core.BucketId, entry *core.En
 	switch entry.Meta.Flag {
 	case DataDeleteFlag:
 		res--
+	case DataDeleteRangeFlag:
+		// One range delete record removes as many currently visible items as
+		// counted when DeleteRange was issued.
+		res -= int64(tx.pendingWrites.getRangeDeleteCount(entry))
 	case DataSetFlag:
 		if idx, ok := tx.db.Index.BTree.exist(bucketId); ok {
 			_, found := idx.Find(entry.Key)
@@ -754,6 +758,20 @@ func (tx *Tx) getChangeCountInEntriesChanges() (int64, error) {
 			res += curRecordCnt
 		}
 	}
+	// Range delete entries are kept in the ordered BTree operation log, not in
+	// the point-entry map, so their record count change is added separately.
+	for _, ops := range tx.pendingWrites.bTreeOps {
+		for _, entry := range ops {
+			if entry.Meta.Flag != DataDeleteRangeFlag {
+				continue
+			}
+			curRecordCnt, err := tx.getEntryNewAddRecordCount(entry)
+			if err != nil {
+				return res, err
+			}
+			res += curRecordCnt
+		}
+	}
 	for _, entriesInDS := range tx.pendingWrites.entries {
 		for _, entries := range entriesInDS {
 			for _, entry := range entries {
@@ -831,28 +849,11 @@ func (tx *Tx) getBucketAndItsStatus(ds core.Ds, name core.BucketName) (BucketSta
 	return BucketStatusUnknown, nil
 }
 
-// findEntryStatus finds the latest status for the certain Entry in Tx
+// findEntryStatus finds the latest status for the certain Entry in Tx.
+// It replays the ordered BTree operation log so that range deletes and point
+// operations observe their true relative order within the transaction.
 func (tx *Tx) findEntryAndItsStatus(_ core.Ds, bucket core.BucketName, key string) (EntryStatus, *core.Entry) {
-	if tx.pendingWrites.size == 0 {
-		return NotFoundEntry, nil
-	}
-	pendingWriteEntries := tx.pendingWrites.entriesInBTree
-	if pendingWriteEntries == nil {
-		return NotFoundEntry, nil
-	}
-	if pendingWriteEntries[bucket] == nil {
-		return NotFoundEntry, nil
-	}
-	entries := pendingWriteEntries[bucket]
-	if entry, exist := entries[key]; exist {
-		switch entry.Meta.Flag {
-		case DataDeleteFlag:
-			return EntryDeleted, nil
-		default:
-			return EntryUpdated, entry
-		}
-	}
-	return NotFoundEntry, nil
+	return tx.pendingWrites.bTreeStatus(bucket, []byte(key))
 }
 
 /*

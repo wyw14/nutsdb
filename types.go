@@ -101,6 +101,9 @@ const (
 
 	// DataBucketDeleteFlag represents the delete bucket flag
 	DataBucketDeleteFlag = core.DataBucketDeleteFlag
+
+	// DataDeleteRangeFlag represents the BTree range delete flag
+	DataDeleteRangeFlag = core.DataDeleteRangeFlag
 )
 
 const (

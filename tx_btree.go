@@ -15,6 +15,7 @@
 package nutsdb
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"math/big"
@@ -55,8 +56,10 @@ func (tx *Tx) PutIfNotExists(bucket string, key, value []byte, ttl uint32) error
 		return ErrNotFoundBucket
 	}
 	bucketId := b.Id
-	_, err := tx.pendingWrites.Get(DataStructureBTree, bucket, key)
-	if err == nil {
+	// Any pending point operation or a covering range delete means the key is
+	// not "not existing" from the transaction's point of view.
+	pendingStatus, _ := tx.findEntryAndItsStatus(DataStructureBTree, bucket, string(key))
+	if pendingStatus != NotFoundEntry {
 		// the key-value is exists.
 		return nil
 	}
@@ -299,9 +302,22 @@ func (tx *Tx) RangeScanEntries(bucket string, start, end []byte, includeKeys, in
 		return nil, nil, ErrNotFoundBucket
 	}
 	bucketId := b.Id
-	pendingKeys, pendingValues := tx.pendingWrites.getDataByRange(start, end, b.Name)
+	view := tx.pendingWrites.buildBTreeView(b.Name)
+	pendingKeys, pendingValues := view.visiblePuts(start, end, true)
 	if index, ok := tx.db.Index.BTree.exist(bucketId); ok {
-		records := index.Range(start, end)
+		// Hide index items that are shadowed inside this transaction:
+		// either overridden by a pending point operation or covered by a
+		// pending range delete.
+		records := make([]*core.Record, 0)
+		for _, record := range index.Range(start, end) {
+			if _, hasPendingPoint := view.lastPoint[string(record.Key)]; hasPendingPoint {
+				continue
+			}
+			if view.isRangeMasked(record.Key) {
+				continue
+			}
+			records = append(records, record)
+		}
 
 		needKeysForMerge := includeKeys || len(pendingKeys) > 0
 
@@ -441,6 +457,105 @@ func (tx *Tx) Delete(bucket string, key []byte) error {
 	return tx.put(bucket, key, nil, Persistent, DataDeleteFlag, uint64(tx.db.ttlService.NowMillis()), DataStructureBTree)
 }
 
+// DeleteRange deletes every currently visible key k with start <= k < end in
+// the given BTree bucket, where ordering follows the database key order
+// (lexicographic byte order). It returns the number of removed items.
+//
+// Validation happens before any mutation: nil/empty boundaries fail with
+// ErrRangeBoundaryEmpty and a reversed interval (start > end) fails with
+// ErrStartGreaterThanEnd. Equal boundaries describe an empty interval, so
+// they succeed without side effects and without writing a record.
+//
+// The operation participates in transaction ordering exactly like Put and
+// Delete: it masks older index items and earlier pending writes inside
+// [start, end), while later Put calls on the same keys remain visible. On
+// commit a single range delete record (one DataDeleteRangeFlag entry with
+// explicitly encoded boundaries) is persisted, regardless of how many keys
+// are removed.
+func (tx *Tx) DeleteRange(bucket string, start, end []byte) (int, error) {
+	if err := tx.checkTxIsClosed(); err != nil {
+		return 0, err
+	}
+
+	b, err := tx.db.bucketMgr.GetBucket(DataStructureBTree, bucket)
+	if err != nil {
+		return 0, err
+	}
+
+	if !tx.writable {
+		return 0, ErrTxNotWritable
+	}
+
+	if len(start) == 0 || len(end) == 0 {
+		return 0, ErrRangeBoundaryEmpty
+	}
+
+	switch bytes.Compare(start, end) {
+	case 0:
+		// Empty half-open interval: successful no-op.
+		return 0, nil
+	case 1:
+		return 0, ErrStartGreaterThanEnd
+	}
+
+	bucketId := b.Id
+	view := tx.pendingWrites.buildBTreeView(bucket)
+
+	visible := make(map[string]struct{})
+
+	if idx, ok := tx.db.Index.BTree.exist(bucketId); ok {
+		for _, record := range idx.Range(start, end) {
+			// idx.Range is inclusive on both sides, DeleteRange is [start, end).
+			if bytes.Compare(record.Key, end) >= 0 {
+				continue
+			}
+
+			key := string(record.Key)
+			if point, hasPoint := view.lastPoint[key]; hasPoint {
+				// A pending point operation overrides the index item.
+				if point.Meta.Flag != DataDeleteFlag {
+					visible[key] = struct{}{}
+				}
+				continue
+			}
+			if view.isRangeMasked(record.Key) {
+				continue
+			}
+			visible[key] = struct{}{}
+		}
+	}
+
+	// Visible pending puts that have no corresponding index item yet.
+	for _, point := range view.lastPoint {
+		if point.Meta.Flag == DataDeleteFlag {
+			continue
+		}
+		if keyInHalfOpenRange(point.Key, start, end) {
+			visible[string(point.Key)] = struct{}{}
+		}
+	}
+
+	deletedCount := len(visible)
+
+	rangeValue := core.EncodeRangeDeleteValue(end)
+	meta := core.NewMetaData().
+		WithTimeStamp(uint64(tx.db.ttlService.NowMillis())).
+		WithKeySize(uint32(len(start))).
+		WithValueSize(uint32(len(rangeValue))).
+		WithFlag(DataDeleteRangeFlag).
+		WithTTL(Persistent).
+		WithStatus(UnCommitted).
+		WithDs(DataStructureBTree).
+		WithTxID(tx.id).
+		WithBucketId(bucketId)
+	rangeEntry := core.NewEntry().WithKey(start).WithMeta(meta).WithValue(rangeValue)
+
+	tx.pendingWrites.submitBTreeRangeEntry(bucket, rangeEntry, deletedCount)
+	tx.size += rangeEntry.Size()
+
+	return deletedCount, nil
+}
+
 // getHintIdxDataItemsWrapper returns keys and values when prefix scanning or range scanning.
 // Note: TTL filtering is handled at the index layer, so records passed here are already valid (non-expired).
 func (tx *Tx) getHintIdxDataItemsWrapper(records []*core.Record, limitNum int, _ core.BucketId, needKeys bool, needValues bool) (keys [][]byte, values [][]byte, err error) {
@@ -497,12 +612,23 @@ func (tx *Tx) tryGet(bucket string, key []byte, solveRecord func(record *core.Re
 		record *core.Record = nil
 		found  bool
 	)
-	entry, err := tx.pendingWrites.Get(DataStructureBTree, bucket, key)
-	found = err == nil
-	if idx, ok := tx.db.Index.BTree.exist(bucketId); ok {
-		record, ok = idx.Find(key)
-		if ok {
-			found = true
+	// A pending point operation keeps its historical precedence (including
+	// point tombstones). Range deletes only mask older index items when no
+	// later point operation touches the key.
+	entry, pointErr := tx.pendingWrites.Get(DataStructureBTree, bucket, key)
+	rangeMasked := false
+	if pointErr != nil {
+		pendingStatus, _ := tx.findEntryAndItsStatus(DataStructureBTree, bucket, string(key))
+		rangeMasked = pendingStatus == EntryDeleted
+	} else {
+		found = true
+	}
+	if !rangeMasked {
+		if idx, ok := tx.db.Index.BTree.exist(bucketId); ok {
+			record, ok = idx.Find(key)
+			if ok {
+				found = true
+			}
 		}
 	}
 	return solveRecord(record, entry, found, bucketId)
@@ -655,6 +781,11 @@ func (tx *Tx) GetTTL(bucket string, key []byte) (int64, error) {
 	// Check pending writes first
 	if pendingTTL, err := tx.pendingWrites.GetTTL(DataStructureBTree, bucket, key); err == nil {
 		return pendingTTL, nil
+	}
+
+	// A pending range delete covering the key hides the older index item.
+	if pendingStatus, _ := tx.findEntryAndItsStatus(DataStructureBTree, bucket, string(key)); pendingStatus == EntryDeleted {
+		return 0, ErrKeyNotFound
 	}
 
 	idx, bucketExists := tx.db.Index.BTree.exist(bucketId)

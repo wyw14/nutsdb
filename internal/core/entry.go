@@ -33,6 +33,11 @@ var (
 	ErrKeyEmpty                  = errors.New("key cannot be empty")
 	ErrInvalidKey                = errors.New("invalid key")
 	ErrDataStructureNotSupported = errors.New("this data structure is not supported for now")
+
+	// ErrRangeDeletePayloadInvalid is returned when a DataDeleteRangeFlag entry
+	// carries a malformed boundary payload. Such a record must never be indexed
+	// as an ordinary key/value entry.
+	ErrRangeDeletePayloadInvalid = errors.New("invalid range delete payload")
 )
 
 const (
@@ -204,8 +209,80 @@ func (e *Entry) IsFilter() bool {
 		DataZPopMaxFlag,
 		DataZPopMinFlag,
 		DataLRemByIndex,
+		DataDeleteRangeFlag,
 	}
 	return utils.OneOfUint16Array(meta.Flag, filterDataSet)
+}
+
+// EncodeRangeDeleteValue encodes the exclusive end boundary of a BTree range
+// delete into the entry value payload.
+//
+// The boundary encoding is explicit and self-describing:
+//
+//	| uvarint(endSize) | end bytes |
+//
+// Together with the entry Key (the inclusive start boundary) and the outer
+// entry CRC/length fields, it gives the range delete record a complete length
+// and checksum protected representation.
+func EncodeRangeDeleteValue(end []byte) []byte {
+	buf := make([]byte, binary.MaxVarintLen32+len(end))
+	n := binary.PutUvarint(buf, uint64(len(end)))
+	copy(buf[n:], end)
+	return buf[:n+len(end)]
+}
+
+// DecodeRangeDeleteValue parses and fully validates the end boundary payload
+// produced by EncodeRangeDeleteValue. It rejects truncated input, non-canonical
+// or overflowing length prefixes, empty boundaries and trailing bytes.
+func DecodeRangeDeleteValue(value []byte) (end []byte, err error) {
+	if len(value) == 0 {
+		return nil, ErrRangeDeletePayloadInvalid
+	}
+
+	endSize, n := binary.Uvarint(value)
+	if n <= 0 || endSize == 0 {
+		return nil, ErrRangeDeletePayloadInvalid
+	}
+	if uint64(n)+endSize != uint64(len(value)) {
+		return nil, ErrRangeDeletePayloadInvalid
+	}
+
+	end = make([]byte, endSize)
+	copy(end, value[n:])
+	return end, nil
+}
+
+// DecodeRangeDelete validates a DataDeleteRangeFlag entry and returns its
+// [start, end) boundaries. The entry is accepted only when:
+//
+//   - its flag is DataDeleteRangeFlag,
+//   - both boundaries are present and non-empty,
+//   - the end boundary length prefix matches the value payload exactly,
+//   - start is strictly smaller than end (half-open, non-empty interval).
+//
+// A malformed record returns ErrRangeDeletePayloadInvalid so callers can refuse
+// it instead of treating its payload as an ordinary value.
+func (e *Entry) DecodeRangeDelete() (start, end []byte, err error) {
+	if e.Meta == nil || e.Meta.Flag != DataDeleteRangeFlag {
+		return nil, nil, ErrRangeDeletePayloadInvalid
+	}
+	if len(e.Key) == 0 {
+		return nil, nil, ErrRangeDeletePayloadInvalid
+	}
+
+	end, err = DecodeRangeDeleteValue(e.Value)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	start = make([]byte, len(e.Key))
+	copy(start, e.Key)
+
+	if bytes.Compare(start, end) >= 0 {
+		return nil, nil, ErrRangeDeletePayloadInvalid
+	}
+
+	return start, end, nil
 }
 
 // Valid check the entry fields valid or not

@@ -2,6 +2,8 @@ package nutsdb
 
 import (
 	"errors"
+
+	"github.com/nutsdb/nutsdb/internal/core"
 )
 
 var (
@@ -63,4 +65,12 @@ var (
 	ErrStartGreaterThanEnd = errors.New("start is greater than end")
 
 	ErrInvalidKey = errors.New("invalid key")
+
+	// ErrRangeBoundaryEmpty is returned by DeleteRange when either boundary is
+	// nil or empty. Empty boundaries are rejected before any change is made.
+	ErrRangeBoundaryEmpty = errors.New("range boundary key cannot be empty")
+
+	// ErrRangeDeleteRecordInvalid is returned when a persisted range delete
+	// record carries a malformed boundary payload.
+	ErrRangeDeleteRecordInvalid = core.ErrRangeDeletePayloadInvalid
 )

@@ -102,6 +102,11 @@ const (
 	// DataBucketDeleteFlag represents the delete bucket flag
 	// This is used for watch manager to delete the bucket when the bucket is deleted.
 	DataBucketDeleteFlag DataFlag = 20
+
+	// DataDeleteRangeFlag represents the BTree range delete flag.
+	// A single record with this flag deletes every currently visible key
+	// within the half-open key range [start, end) encoded in its payload.
+	DataDeleteRangeFlag DataFlag = 21
 )
 
 const (

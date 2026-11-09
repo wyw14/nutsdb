@@ -699,6 +699,13 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 			continue // Skip if bucket doesn't exist
 		}
 
+		// Range delete tombstones are never rewritten into merge/hint files.
+		// If one is encountered anyway, skip it: its boundary payload is not
+		// represented in the hint format and it must never become a value.
+		if hintEntry.Flag == DataDeleteRangeFlag {
+			continue
+		}
+
 		// Create a record from hint entry
 		record := core.NewRecord()
 		record.WithKey(hintEntry.Key).
@@ -812,12 +819,38 @@ func (db *DB) buildBTreeIdx(record *core.Record, entry *core.Entry) error {
 
 	bTree := db.Index.BTree.GetWithDefault(bucketId)
 
+	if meta.Flag == DataDeleteRangeFlag {
+		return db.applyBTreeRangeDelete(bTree, bucketId, entry)
+	}
+
 	if db.ttlService.IsExpired(record.TTL, record.Timestamp) || meta.Flag == DataDeleteFlag {
 		bTree.Delete(key)
 		db.ttlService.DeregisterKeyFromActiveExpiration(bucketId, key)
 	} else {
 		bTree.InsertRecord(record.Key, record)
 	}
+	return nil
+}
+
+// applyBTreeRangeDelete applies one committed DataDeleteRangeFlag record to
+// the in-memory BTree index. The boundary payload is fully validated first so
+// a malformed range record can never be indexed as an ordinary key/value.
+// Memory cleanup is performed key by key; constant time is not required here.
+func (db *DB) applyBTreeRangeDelete(bTree *data.BTree, bucketId core.BucketId, entry *core.Entry) error {
+	start, end, err := entry.DecodeRangeDelete()
+	if err != nil {
+		return err
+	}
+
+	for _, rec := range bTree.Range(start, end) {
+		// BTree.Range is inclusive on both sides; range delete uses [start, end).
+		if bytes.Compare(rec.Key, end) >= 0 {
+			continue
+		}
+		bTree.Delete(rec.Key)
+		db.ttlService.DeregisterKeyFromActiveExpiration(bucketId, rec.Key)
+	}
+
 	return nil
 }
 
