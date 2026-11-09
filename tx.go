@@ -45,6 +45,11 @@ type Tx struct {
 	size              int64
 	pendingBucketList pendingBucketList
 	lockAcquired      atomic.Bool // track if lock was acquired (for WriteBatch optimization)
+	// writeVersion is a monotonic counter bumped on every key write and every
+	// bucket write. Snapshot-style iterators (e.g. MergeIterator) record the
+	// version at creation time and refuse to serve a mixed view once the
+	// transaction's pending layer changes.
+	writeVersion uint64
 }
 
 type txnCb struct {
@@ -54,6 +59,7 @@ type txnCb struct {
 }
 
 func (tx *Tx) submitEntry(ds uint16, bucket string, e *core.Entry) {
+	tx.writeVersion++
 	tx.pendingWrites.submitEntry(ds, bucket, e)
 }
 
@@ -683,6 +689,7 @@ func (tx *Tx) buildIdxes(records []*core.Record, entries []*core.Entry) error {
 }
 
 func (tx *Tx) putBucket(b *core.Bucket) error {
+	tx.writeVersion++
 	if _, exist := tx.pendingBucketList[b.Ds]; !exist {
 		tx.pendingBucketList[b.Ds] = map[core.BucketName]*core.Bucket{}
 	}

@@ -100,11 +100,9 @@ func (tx *Tx) NewBucket(ds uint16, name string) (err error) {
 		Ds:   ds,
 		Name: name,
 	}
-	if _, exist := tx.pendingBucketList[ds]; !exist {
-		tx.pendingBucketList[ds] = map[core.BucketName]*core.Bucket{}
-	}
-	tx.pendingBucketList[ds][name] = bucket
-	return nil
+	// Route through putBucket so every bucket write bumps the transaction
+	// write version observed by snapshot iterators.
+	return tx.putBucket(bucket)
 }
 
 // DeleteBucket delete bucket depends on ds (represents the data structure)

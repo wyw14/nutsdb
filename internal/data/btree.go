@@ -30,17 +30,38 @@ var ErrKeyNotFound = errors.New("key not found")
 // BTree represents a B-tree index with optional TTL support.
 type BTree struct {
 	index      *btree.BTreeG[*core.Item[core.Record]]
+	less       func(a, b []byte) bool
 	ttlChecker *ttl.Checker
 	bucketId   uint64
 }
 
+// defaultKeyLess orders keys lexicographically by bytes, which is the
+// historical default ordering of NutsDB.
+func defaultKeyLess(a, b []byte) bool {
+	return bytes.Compare(a, b) == -1
+}
+
 // NewBTree creates a new BTree instance with optional TTL support.
+// Keys are ordered lexicographically by bytes.
 // If no ttlChecker is provided, TTL checking is disabled (useful for internal use like List).
 func NewBTree(bucketId uint64, ttlCheckers ...*ttl.Checker) *BTree {
+	return NewBTreeWithLess(bucketId, defaultKeyLess, ttlCheckers...)
+}
+
+// NewBTreeWithLess creates a new BTree instance whose keys are ordered by the
+// provided less function. A nil less function falls back to the default
+// lexicographic ordering. The same less function must be used consistently for
+// every operation on the returned tree, because Seek/iteration positions rely on
+// the tree's ordering.
+func NewBTreeWithLess(bucketId uint64, less func(a, b []byte) bool, ttlCheckers ...*ttl.Checker) *BTree {
+	if less == nil {
+		less = defaultKeyLess
+	}
 	bt := &BTree{
 		index: btree.NewBTreeG(func(a, b *core.Item[core.Record]) bool {
-			return bytes.Compare(a.Key, b.Key) == -1
+			return less(a.Key, b.Key)
 		}),
+		less:     less,
 		bucketId: bucketId,
 	}
 	if len(ttlCheckers) > 0 {
@@ -48,6 +69,19 @@ func NewBTree(bucketId uint64, ttlCheckers ...*ttl.Checker) *BTree {
 	}
 	// If no ttlChecker provided, bt.ttlChecker remains nil (TTL checking disabled)
 	return bt
+}
+
+// Less reports whether key a must be ordered before key b using the comparator
+// configured for this BTree.
+func (bt *BTree) Less(a, b []byte) bool {
+	return bt.less(a, b)
+}
+
+// IsValid reports whether the item is still valid (not expired). When TTL
+// checking is disabled every non-nil item is considered valid. Expired items
+// trigger the configured expiration callback, mirroring Find/Scanner behavior.
+func (bt *BTree) IsValid(item *core.Item[core.Record]) bool {
+	return bt.isValid(item)
 }
 
 // isValid checks if an item is valid (not expired) using the TTL checker.

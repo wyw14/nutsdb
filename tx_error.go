@@ -63,4 +63,13 @@ var (
 	ErrStartGreaterThanEnd = errors.New("start is greater than end")
 
 	ErrInvalidKey = errors.New("invalid key")
+
+	// ErrMergeIteratorStale is returned by a MergeIterator when the owning
+	// transaction performed additional key or bucket writes after the iterator
+	// was created. The iterator keeps its creation-time snapshot and refuses to
+	// mix two different pending versions.
+	ErrMergeIteratorStale = errors.New("merge iterator is stale: transaction writes changed after iterator creation")
+
+	// ErrIteratorReleased is returned when an iterator is used after Release.
+	ErrIteratorReleased = errors.New("iterator has been released")
 )

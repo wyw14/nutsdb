@@ -15,6 +15,8 @@
 package nutsdb
 
 import (
+	"bytes"
+
 	"github.com/nutsdb/nutsdb/internal/core"
 	"github.com/nutsdb/nutsdb/internal/data"
 )
@@ -90,8 +92,24 @@ type BTreeIndex struct {
 
 func (idx *BTreeIndex) GetWithDefault(id core.BucketId) *data.BTree {
 	return idx.computeIfAbsent(id, func() *data.BTree {
-		return data.NewBTree(id, idx.index.db.ttlService.GetChecker())
+		return data.NewBTreeWithLess(id, idx.index.db.keyLessFunc(), idx.index.db.ttlService.GetChecker())
 	})
+}
+
+// keyLessFunc returns the key comparator configured on the database. When no
+// custom LessFunc is configured it falls back to lexicographic byte ordering.
+// The BTree indexes, the merge iterator and all boundary/direction decisions
+// must share this single comparator so that Seek results stay consistent.
+func (db *DB) keyLessFunc() func(a, b []byte) bool {
+	if db.opt.LessFunc == nil {
+		return func(a, b []byte) bool {
+			return bytes.Compare(a, b) < 0
+		}
+	}
+	less := db.opt.LessFunc
+	return func(a, b []byte) bool {
+		return less(string(a), string(b))
+	}
 }
 
 type SetIndex struct {
