@@ -63,4 +63,27 @@ var (
 	ErrStartGreaterThanEnd = errors.New("start is greater than end")
 
 	ErrInvalidKey = errors.New("invalid key")
+
+	// ErrMultiCASCompareFailed is returned by MultiCompareAndSwap when an
+	// expectation (existence or byte value) is not matched. The failed input
+	// position is returned together with this error.
+	ErrMultiCASCompareFailed = errors.New("multi compare-and-swap expectation failed")
+
+	// ErrMultiCASInvalidAction is returned when an item carries an action that
+	// is not one of the supported MCASAction values.
+	ErrMultiCASInvalidAction = errors.New("multi compare-and-swap invalid action")
+
+	// ErrMultiCASDuplicateKey is returned when the same bucket/key pair appears
+	// more than once in a single MultiCompareAndSwap call.
+	ErrMultiCASDuplicateKey = errors.New("multi compare-and-swap contains duplicate bucket/key")
+
+	// ErrMultiCASOptionConflict is returned when an item's action, TTL and value
+	// options contradict each other (for example setting a new TTL together with
+	// KeepTTL, or attaching a value to a delete action).
+	ErrMultiCASOptionConflict = errors.New("multi compare-and-swap options conflict")
+
+	// ErrMultiCASNoTTLToKeep is returned when KeepTTL is requested for a key
+	// that is expected to be absent, because a missing item has no absolute
+	// expiration deadline to preserve.
+	ErrMultiCASNoTTLToKeep = errors.New("multi compare-and-swap cannot keep the TTL of a missing key")
 )

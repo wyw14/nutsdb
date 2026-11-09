@@ -20,6 +20,7 @@ import (
 	"math"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3627,7 +3628,6 @@ func TestTx_TTL_LazyDeletionFromIndex(t *testing.T) {
 			err := db.View(func(tx *Tx) error {
 				idx, ok := db.Index.BTree.exist(1)
 				r.True(ok)
-
 				record, found := idx.FindForVerification(key)
 				r.True(found, "new key should exist in index")
 				r.NotNil(record)
@@ -3636,5 +3636,679 @@ func TestTx_TTL_LazyDeletionFromIndex(t *testing.T) {
 			})
 			r.NoError(err)
 		})
+	})
+}
+
+// reopenDB closes and re-opens a database with the same options and mock clock.
+func reopenDB(t *testing.T, db *DB, opts Options, mc ttl.Clock) *DB {
+	require.NoError(t, db.Close())
+	reopened, err := Open(opts)
+	require.NoError(t, err)
+	reopened.ttlService.SetClock(mc)
+	return reopened
+}
+
+// TestTx_MultiCompareAndSwap_SuccessAndCommit verifies that a fully matched
+// batch applies every action and survives a commit plus a database re-open.
+func TestTx_MultiCompareAndSwap_SuccessAndCommit(t *testing.T) {
+	bucket := "mcas_bucket"
+	mc := ttl.NewMockClock(time.Now().UnixMilli())
+	opts := DefaultOptions
+	opts.Dir = filepath.Join(t.TempDir(), "nutsdb-mcas")
+	opts.TTLConfig.EnableTimingWheel = false
+	defer removeDir(opts.Dir)
+
+	db, err := Open(opts)
+	require.NoError(t, err)
+	db.ttlService.SetClock(mc)
+
+	txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+	txPut(t, db, bucket, []byte("k1"), []byte("v1"), Persistent, nil, nil)
+	txPut(t, db, bucket, []byte("k2"), []byte("v2"), Persistent, nil, nil)
+	txPut(t, db, bucket, []byte("k3"), []byte("v3"), Persistent, nil, nil)
+
+	err = db.Update(func(tx *Tx) error {
+		failed, err := tx.MultiCompareAndSwap(
+			MultiCASItem{
+				Bucket: bucket, Key: []byte("k1"), ExpectExists: true, ExpectValue: []byte("v1"),
+				Action: MCASActionReplace, NewValue: []byte("nv1"), TTL: Persistent,
+			},
+			MultiCASItem{
+				Bucket: bucket, Key: []byte("k2"), ExpectExists: true, ExpectValue: []byte("v2"),
+				Action: MCASActionDelete,
+			},
+			MultiCASItem{
+				Bucket: bucket, Key: []byte("k3"), ExpectExists: true, ExpectValue: []byte("v3"),
+				Action: MCASActionReplace, NewValue: []byte("nv3"), TTL: 100,
+			},
+		)
+		require.Equal(t, -1, failed)
+		return err
+	})
+	require.NoError(t, err)
+
+	// The whole group is visible before re-opening.
+	txGet(t, db, bucket, []byte("k1"), []byte("nv1"), nil)
+	txGet(t, db, bucket, []byte("k2"), nil, ErrKeyNotFound)
+	txGet(t, db, bucket, []byte("k3"), []byte("nv3"), nil)
+
+	db = reopenDB(t, db, opts, mc)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	// The whole group survives re-opening.
+	txGet(t, db, bucket, []byte("k1"), []byte("nv1"), nil)
+	txGet(t, db, bucket, []byte("k2"), nil, ErrKeyNotFound)
+	txGet(t, db, bucket, []byte("k3"), []byte("nv3"), nil)
+}
+
+// TestTx_MultiCompareAndSwap_ThirdItemMismatch verifies that when the first
+// two items match but the third one does not, no pending state is modified and
+// the transaction stays usable.
+func TestTx_MultiCompareAndSwap_ThirdItemMismatch(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("k1"), []byte("v1"), Persistent, nil, nil)
+		txPut(t, db, bucket, []byte("k2"), []byte("v2"), Persistent, nil, nil)
+		txPut(t, db, bucket, []byte("k3"), []byte("v3"), Persistent, nil, nil)
+
+		tx, err := db.Begin(true)
+		r.NoError(err)
+
+		sizeBefore := tx.size
+		pendingBefore := tx.pendingWrites.size
+
+		failed, err := tx.MultiCompareAndSwap(
+			MultiCASItem{
+				Bucket: bucket, Key: []byte("k1"), ExpectExists: true, ExpectValue: []byte("v1"),
+				Action: MCASActionReplace, NewValue: []byte("nv1"), TTL: Persistent,
+			},
+			MultiCASItem{
+				Bucket: bucket, Key: []byte("k2"), ExpectExists: true, ExpectValue: []byte("v2"),
+				Action: MCASActionDelete,
+			},
+			MultiCASItem{
+				Bucket: bucket, Key: []byte("k3"), ExpectExists: true, ExpectValue: []byte("wrong"),
+				Action: MCASActionReplace, NewValue: []byte("nv3"), TTL: Persistent,
+			},
+		)
+		r.Equal(2, failed)
+		r.ErrorIs(err, ErrMultiCASCompareFailed)
+
+		// Nothing was applied: values, tx.size and pending count are untouched.
+		value, err := tx.Get(bucket, []byte("k1"))
+		r.NoError(err)
+		r.Equal([]byte("v1"), value)
+		value, err = tx.Get(bucket, []byte("k2"))
+		r.NoError(err)
+		r.Equal([]byte("v2"), value)
+		value, err = tx.Get(bucket, []byte("k3"))
+		r.NoError(err)
+		r.Equal([]byte("v3"), value)
+		r.Equal(sizeBefore, tx.size)
+		r.Equal(pendingBefore, tx.pendingWrites.size)
+
+		// The transaction is still usable.
+		r.NoError(tx.Put(bucket, []byte("k4"), []byte("v4"), Persistent))
+		r.NoError(tx.Commit())
+
+		txGet(t, db, bucket, []byte("k1"), []byte("v1"), nil)
+		txGet(t, db, bucket, []byte("k2"), []byte("v2"), nil)
+		txGet(t, db, bucket, []byte("k3"), []byte("v3"), nil)
+		txGet(t, db, bucket, []byte("k4"), []byte("v4"), nil)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_SameTxWriteThenCompare verifies comparison reads
+// see Put/Delete operations performed earlier in the same transaction.
+func TestTx_MultiCompareAndSwap_SameTxWriteThenCompare(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		tx, err := db.Begin(true)
+		r.NoError(err)
+
+		// Pending Put is visible to the comparison.
+		r.NoError(tx.Put(bucket, []byte("k1"), []byte("v1"), Persistent))
+		failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+			Bucket: bucket, Key: []byte("k1"), ExpectExists: true, ExpectValue: []byte("v1"),
+			Action: MCASActionReplace, NewValue: []byte("nv1"), TTL: Persistent,
+		})
+		r.Equal(-1, failed)
+		r.NoError(err)
+		value, err := tx.Get(bucket, []byte("k1"))
+		r.NoError(err)
+		r.Equal([]byte("nv1"), value)
+
+		// Pending Put followed by pending Delete is seen as missing, then recreated.
+		r.NoError(tx.Put(bucket, []byte("k2"), []byte("v2"), Persistent))
+		r.NoError(tx.Delete(bucket, []byte("k2")))
+		failed, err = tx.MultiCompareAndSwap(MultiCASItem{
+			Bucket: bucket, Key: []byte("k2"), ExpectExists: false,
+			Action: MCASActionReplace, NewValue: []byte("nv2"), TTL: Persistent,
+		})
+		r.Equal(-1, failed)
+		r.NoError(err)
+		value, err = tx.Get(bucket, []byte("k2"))
+		r.NoError(err)
+		r.Equal([]byte("nv2"), value)
+
+		// A pending Put cannot be treated as missing.
+		failed, err = tx.MultiCompareAndSwap(MultiCASItem{
+			Bucket: bucket, Key: []byte("k1"), ExpectExists: false,
+			Action: MCASActionReplace, NewValue: []byte("xx"), TTL: Persistent,
+		})
+		r.Equal(0, failed)
+		r.ErrorIs(err, ErrMultiCASCompareFailed)
+
+		r.NoError(tx.Commit())
+		txGet(t, db, bucket, []byte("k1"), []byte("nv1"), nil)
+		txGet(t, db, bucket, []byte("k2"), []byte("nv2"), nil)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_DeleteThenRecreate verifies deleting a committed
+// key and recreating it inside one transaction via a missing expectation.
+func TestTx_MultiCompareAndSwap_DeleteThenRecreate(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("k1"), []byte("v1"), Persistent, nil, nil)
+
+		r.NoError(db.Update(func(tx *Tx) error {
+			r.NoError(tx.Delete(bucket, []byte("k1")))
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: []byte("k1"), ExpectExists: false,
+				Action: MCASActionReplace, NewValue: []byte("recreated"), TTL: Persistent,
+			})
+			r.Equal(-1, failed)
+			return err
+		}))
+
+		txGet(t, db, bucket, []byte("k1"), []byte("recreated"), nil)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_ZeroLengthValue verifies that an existing empty
+// value compares successfully and is never confused with a missing key.
+func TestTx_MultiCompareAndSwap_ZeroLengthValue(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("empty"), []byte{}, Persistent, nil, nil)
+
+		// Existing zero-length value matches an empty (nil) expected value.
+		r.NoError(db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: []byte("empty"), ExpectExists: true, ExpectValue: nil,
+				Action: MCASActionReplace, NewValue: []byte{}, TTL: Persistent,
+			})
+			r.Equal(-1, failed)
+			return err
+		}))
+		txGet(t, db, bucket, []byte("empty"), []byte{}, nil)
+
+		// Existing empty value is still "exists": expecting absence fails.
+		err := db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: []byte("empty"), ExpectExists: false,
+				Action: MCASActionReplace, NewValue: []byte("x"), TTL: Persistent,
+			})
+			r.Equal(0, failed)
+			return err
+		})
+		r.ErrorIs(err, ErrMultiCASCompareFailed)
+
+		// A genuinely missing key with nil expected value matches and is created.
+		r.NoError(db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: []byte("missing"), ExpectExists: false, ExpectValue: nil,
+				Action: MCASActionReplace, NewValue: []byte("born"), TTL: Persistent,
+			})
+			r.Equal(-1, failed)
+			return err
+		}))
+		txGet(t, db, bucket, []byte("missing"), []byte("born"), nil)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_ExpirationBoundary verifies expiration is judged
+// at one captured moment and the exact deadline boundary counts as expired.
+func TestTx_MultiCompareAndSwap_ExpirationBoundary(t *testing.T) {
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("k1"), []byte("v1"), 1, nil, nil)
+		txPut(t, db, bucket, []byte("k2"), []byte("v2"), 1, nil, nil)
+
+		// 999ms: still alive, expectation matches.
+		mc.AdvanceTime(999 * time.Millisecond)
+		r.NoError(db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: []byte("k1"), ExpectExists: true, ExpectValue: []byte("v1"),
+				Action: MCASActionReplace, NewValue: []byte("nv1"), TTL: Persistent,
+			})
+			r.Equal(-1, failed)
+			return err
+		}))
+		txGet(t, db, bucket, []byte("k1"), []byte("nv1"), nil)
+
+		// 1000ms exactly: k2 is expired and treated as non-existent.
+		mc.AdvanceTime(1 * time.Millisecond)
+		r.NoError(db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: []byte("k2"), ExpectExists: false,
+				Action: MCASActionReplace, NewValue: []byte("reborn"), TTL: Persistent,
+			})
+			r.Equal(-1, failed)
+			return err
+		}))
+		txGet(t, db, bucket, []byte("k2"), []byte("reborn"), nil)
+
+		// An expired key expected to exist fails at its real position.
+		txPut(t, db, bucket, []byte("k3"), []byte("v3"), 1, nil, nil)
+		mc.AdvanceTime(1 * time.Second)
+		err := db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(
+				MultiCASItem{
+					Bucket: bucket, Key: []byte("k1"), ExpectExists: true, ExpectValue: []byte("nv1"),
+					Action: MCASActionDelete,
+				},
+				MultiCASItem{
+					Bucket: bucket, Key: []byte("k3"), ExpectExists: true, ExpectValue: []byte("v3"),
+					Action: MCASActionDelete,
+				},
+			)
+			r.Equal(1, failed)
+			return err
+		})
+		r.ErrorIs(err, ErrMultiCASCompareFailed)
+		// The failed batch must not have deleted k1.
+		txGet(t, db, bucket, []byte("k1"), []byte("nv1"), nil)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_KeepTTL verifies KeepTTL preserves the original
+// absolute deadline instead of refreshing the remaining lifetime.
+func TestTx_MultiCompareAndSwap_KeepTTL(t *testing.T) {
+	runNutsDBTestWithMockClock(t, nil, func(t *testing.T, db *DB, mc ttl.Clock) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("keep"), []byte("v1"), 10, nil, nil)
+		txPut(t, db, bucket, []byte("refresh"), []byte("v1"), 10, nil, nil)
+		txPut(t, db, bucket, []byte("forever"), []byte("v1"), Persistent, nil, nil)
+
+		var originalTimestamp uint64
+		r.NoError(db.View(func(tx *Tx) error {
+			b, err := db.bucketMgr.GetBucket(DataStructureBTree, bucket)
+			r.NoError(err)
+			idx, ok := db.Index.BTree.exist(b.Id)
+			r.True(ok)
+			rec, found := idx.FindForVerification([]byte("keep"))
+			r.True(found)
+			originalTimestamp = rec.Timestamp
+			return nil
+		}))
+
+		mc.AdvanceTime(3 * time.Second)
+
+		r.NoError(db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(
+				MultiCASItem{
+					Bucket: bucket, Key: []byte("keep"), ExpectExists: true, ExpectValue: []byte("v1"),
+					Action: MCASActionReplaceKeepTTL, NewValue: []byte("v2"),
+				},
+				MultiCASItem{
+					Bucket: bucket, Key: []byte("refresh"), ExpectExists: true, ExpectValue: []byte("v1"),
+					Action: MCASActionReplace, NewValue: []byte("v2"), TTL: 10,
+				},
+				MultiCASItem{
+					Bucket: bucket, Key: []byte("forever"), ExpectExists: true, ExpectValue: []byte("v1"),
+					Action: MCASActionReplaceKeepTTL, NewValue: []byte("v2"),
+				},
+			)
+			r.Equal(-1, failed)
+			return err
+		}))
+
+		// The kept entry reuses the original timestamp and TTL verbatim.
+		r.NoError(db.View(func(tx *Tx) error {
+			b, err := db.bucketMgr.GetBucket(DataStructureBTree, bucket)
+			r.NoError(err)
+			idx, ok := db.Index.BTree.exist(b.Id)
+			r.True(ok)
+			rec, found := idx.FindForVerification([]byte("keep"))
+			r.True(found)
+			r.Equal(uint32(10), rec.TTL)
+			r.Equal(originalTimestamp, rec.Timestamp)
+			rec, found = idx.FindForVerification([]byte("forever"))
+			r.True(found)
+			r.Equal(uint32(Persistent), rec.TTL)
+			return nil
+		}))
+
+		// At t0+9s the kept entry is still alive (deadline t0+10s).
+		mc.AdvanceTime(6 * time.Second)
+		txGet(t, db, bucket, []byte("keep"), []byte("v2"), nil)
+		txGet(t, db, bucket, []byte("refresh"), []byte("v2"), nil)
+		txGet(t, db, bucket, []byte("forever"), []byte("v2"), nil)
+
+		// At t0+10s the kept entry expires exactly at its original deadline,
+		// while the refreshed entry (new deadline t0+13s) and persistent one live on.
+		mc.AdvanceTime(1 * time.Second)
+		txGet(t, db, bucket, []byte("keep"), nil, ErrKeyNotFound)
+		txGet(t, db, bucket, []byte("refresh"), []byte("v2"), nil)
+		txGet(t, db, bucket, []byte("forever"), []byte("v2"), nil)
+
+		// KeepTTL on an absent key is rejected explicitly and leaves no state behind.
+		tx, err := db.Begin(true)
+		r.NoError(err)
+		sizeBefore := tx.size
+		failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+			Bucket: bucket, Key: []byte("ghost"), ExpectExists: false,
+			Action: MCASActionReplaceKeepTTL, NewValue: []byte("v"),
+		})
+		r.Equal(-1, failed)
+		r.ErrorIs(err, ErrMultiCASNoTTLToKeep)
+		r.Equal(sizeBefore, tx.size)
+		r.NoError(tx.Rollback())
+	})
+}
+
+// TestTx_MultiCompareAndSwap_ValidationFailures exercises every structural
+// rejection path and asserts the transaction state is never touched.
+func TestTx_MultiCompareAndSwap_ValidationFailures(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		otherBucket := "mcas_other"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txCreateBucket(t, db, DataStructureBTree, otherBucket, nil)
+		txPut(t, db, bucket, []byte("k1"), []byte("v1"), Persistent, nil, nil)
+
+		base := func(action MCASAction) MultiCASItem {
+			return MultiCASItem{
+				Bucket: bucket, Key: []byte("k1"), ExpectExists: true, ExpectValue: []byte("v1"),
+				Action: action, NewValue: []byte("nv"), TTL: Persistent,
+			}
+		}
+
+		cases := []struct {
+			name string
+			item MultiCASItem
+			want error
+		}{
+			{"invalid action", func() MultiCASItem { i := base(MCASAction(99)); return i }(), ErrMultiCASInvalidAction},
+			{"empty key", func() MultiCASItem { i := base(MCASActionReplace); i.Key = nil; return i }(), ErrKeyEmpty},
+			{"delete with new value", func() MultiCASItem { i := base(MCASActionDelete); i.NewValue = []byte("x"); return i }(), ErrMultiCASOptionConflict},
+			{"delete with ttl", func() MultiCASItem { i := base(MCASActionDelete); i.NewValue = nil; i.TTL = 5; return i }(), ErrMultiCASOptionConflict},
+			{"delete expecting absence", func() MultiCASItem {
+				i := base(MCASActionDelete)
+				i.NewValue = nil
+				i.ExpectExists = false
+				return i
+			}(), ErrMultiCASOptionConflict},
+			{"keep ttl with new ttl", func() MultiCASItem { i := base(MCASActionReplaceKeepTTL); i.TTL = 5; return i }(), ErrMultiCASOptionConflict},
+			{"keep ttl expecting absence", func() MultiCASItem {
+				i := base(MCASActionReplaceKeepTTL)
+				i.ExpectExists = false
+				return i
+			}(), ErrMultiCASNoTTLToKeep},
+			{"missing bucket", func() MultiCASItem {
+				i := base(MCASActionReplace)
+				i.Bucket = "no_such_bucket"
+				return i
+			}(), ErrBucketNotFound},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				tx, err := db.Begin(true)
+				r.NoError(err)
+				sizeBefore := tx.size
+				pendingBefore := tx.pendingWrites.size
+				failed, err := tx.MultiCompareAndSwap(tc.item)
+				r.Equal(-1, failed)
+				r.ErrorIs(err, tc.want)
+				r.Equal(sizeBefore, tx.size)
+				r.Equal(pendingBefore, tx.pendingWrites.size)
+				// The transaction remains usable after the rejection.
+				r.NoError(tx.Put(bucket, []byte("still-alive"), []byte("1"), Persistent))
+				r.NoError(tx.Commit())
+			})
+		}
+
+		// Duplicate bucket/key is rejected; same key in another bucket is fine.
+		t.Run("duplicate key rejected", func(t *testing.T) {
+			tx, err := db.Begin(true)
+			r.NoError(err)
+			sizeBefore := tx.size
+			failed, err := tx.MultiCompareAndSwap(
+				MultiCASItem{Bucket: bucket, Key: []byte("dup"), ExpectExists: false, Action: MCASActionReplace, NewValue: []byte("a"), TTL: Persistent},
+				MultiCASItem{Bucket: bucket, Key: []byte("dup"), ExpectExists: false, Action: MCASActionReplace, NewValue: []byte("b"), TTL: Persistent},
+			)
+			r.Equal(-1, failed)
+			r.ErrorIs(err, ErrMultiCASDuplicateKey)
+			r.Equal(sizeBefore, tx.size)
+			r.NoError(tx.Rollback())
+		})
+
+		t.Run("same key across buckets allowed", func(t *testing.T) {
+			r.NoError(db.Update(func(tx *Tx) error {
+				failed, err := tx.MultiCompareAndSwap(
+					MultiCASItem{Bucket: bucket, Key: []byte("shared"), ExpectExists: false, Action: MCASActionReplace, NewValue: []byte("a"), TTL: Persistent},
+					MultiCASItem{Bucket: otherBucket, Key: []byte("shared"), ExpectExists: false, Action: MCASActionReplace, NewValue: []byte("b"), TTL: Persistent},
+				)
+				r.Equal(-1, failed)
+				return err
+			}))
+			txGet(t, db, bucket, []byte("shared"), []byte("a"), nil)
+			txGet(t, db, otherBucket, []byte("shared"), []byte("b"), nil)
+		})
+
+		// Read-only transactions cannot run MCAS; an empty batch is a no-op.
+		t.Run("read only and empty", func(t *testing.T) {
+			r.NoError(db.View(func(tx *Tx) error {
+				failed, err := tx.MultiCompareAndSwap(base(MCASActionReplace))
+				r.Equal(-1, failed)
+				r.ErrorIs(err, ErrTxNotWritable)
+				failed, err = tx.MultiCompareAndSwap()
+				r.Equal(-1, failed)
+				r.NoError(err)
+				return nil
+			}))
+		})
+	})
+}
+
+// TestTx_MultiCompareAndSwap_TxnTooBig verifies the transaction limits are
+// enforced before any pending state is modified.
+func TestTx_MultiCompareAndSwap_TxnTooBig(t *testing.T) {
+	opts := DefaultOptions
+	opts.Dir = filepath.Join(t.TempDir(), "nutsdb-mcas-limit")
+	opts.MaxBatchCount = 2
+	opts.MaxBatchSize = 1 << 30
+	defer removeDir(opts.Dir)
+
+	db, err := Open(opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	bucket := "mcas_bucket"
+	txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+	tx, err := db.Begin(true)
+	require.NoError(t, err)
+	sizeBefore := tx.size
+	failed, err := tx.MultiCompareAndSwap(
+		MultiCASItem{Bucket: bucket, Key: []byte("a"), ExpectExists: false, Action: MCASActionReplace, NewValue: []byte("1"), TTL: Persistent},
+		MultiCASItem{Bucket: bucket, Key: []byte("b"), ExpectExists: false, Action: MCASActionReplace, NewValue: []byte("2"), TTL: Persistent},
+	)
+	require.Equal(t, -1, failed)
+	require.ErrorIs(t, err, ErrTxnTooBig)
+	require.Equal(t, sizeBefore, tx.size)
+	require.Equal(t, 0, tx.pendingWrites.size)
+
+	// A single item stays under the limit and the transaction still works.
+	failed, err = tx.MultiCompareAndSwap(MultiCASItem{
+		Bucket: bucket, Key: []byte("a"), ExpectExists: false,
+		Action: MCASActionReplace, NewValue: []byte("1"), TTL: Persistent,
+	})
+	require.Equal(t, -1, failed)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	txGet(t, db, bucket, []byte("a"), []byte("1"), nil)
+	txGet(t, db, bucket, []byte("b"), nil, ErrKeyNotFound)
+}
+
+// TestTx_MultiCompareAndSwap_DefensiveCopy verifies caller mutations of the
+// input slices cannot change the pending result.
+func TestTx_MultiCompareAndSwap_DefensiveCopy(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		key := []byte("k1")
+		newValue := []byte("nv1")
+		r.NoError(db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: key, ExpectExists: false,
+				Action: MCASActionReplace, NewValue: newValue, TTL: Persistent,
+			})
+			r.Equal(-1, failed)
+			return err
+		}))
+
+		key[0] = 'X'
+		newValue[0] = 'Y'
+
+		txGet(t, db, bucket, []byte("k1"), []byte("nv1"), nil)
+		txGet(t, db, bucket, []byte("X1"), nil, ErrKeyNotFound)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_FailureKeepsUnrelatedWrites verifies that after a
+// failed batch, unrelated writes already staged in the same transaction still
+// commit successfully.
+func TestTx_MultiCompareAndSwap_FailureKeepsUnrelatedWrites(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("target"), []byte("v"), Persistent, nil, nil)
+
+		tx, err := db.Begin(true)
+		r.NoError(err)
+		r.NoError(tx.Put(bucket, []byte("unrelated"), []byte("u"), Persistent))
+
+		failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+			Bucket: bucket, Key: []byte("target"), ExpectExists: true, ExpectValue: []byte("mismatch"),
+			Action: MCASActionReplace, NewValue: []byte("nv"), TTL: Persistent,
+		})
+		r.Equal(0, failed)
+		r.ErrorIs(err, ErrMultiCASCompareFailed)
+		r.NoError(tx.Commit())
+
+		txGet(t, db, bucket, []byte("unrelated"), []byte("u"), nil)
+		txGet(t, db, bucket, []byte("target"), []byte("v"), nil)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_ConcurrentWriters verifies parallel write
+// transactions follow the existing database lock rules and all succeed.
+func TestTx_MultiCompareAndSwap_ConcurrentWriters(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		const n = 20
+		var wg sync.WaitGroup
+		wg.Add(n)
+		errs := make(chan error, n)
+		for i := 0; i < n; i++ {
+			go func(i int) {
+				defer wg.Done()
+				key := []byte(fmt.Sprintf("key-%02d", i))
+				err := db.Update(func(tx *Tx) error {
+					failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+						Bucket: bucket, Key: key, ExpectExists: false,
+						Action: MCASActionReplace, NewValue: []byte(fmt.Sprintf("val-%02d", i)), TTL: Persistent,
+					})
+					if failed != -1 {
+						return fmt.Errorf("unexpected failed index %d", failed)
+					}
+					return err
+				})
+				errs <- err
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			r.NoError(err)
+		}
+		for i := 0; i < n; i++ {
+			txGet(t, db, bucket, []byte(fmt.Sprintf("key-%02d", i)), []byte(fmt.Sprintf("val-%02d", i)), nil)
+		}
+
+		// Contended CAS on one key: serialized transactions mean one update
+		// wins and the stale expectation is reported as a comparison failure.
+		txPut(t, db, bucket, []byte("contended"), []byte("v0"), Persistent, nil, nil)
+		var success, compareFail int64
+		var wg2 sync.WaitGroup
+		wg2.Add(2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				defer wg2.Done()
+				err := db.Update(func(tx *Tx) error {
+					_, mcasErr := tx.MultiCompareAndSwap(MultiCASItem{
+						Bucket: bucket, Key: []byte("contended"), ExpectExists: true, ExpectValue: []byte("v0"),
+						Action: MCASActionReplace, NewValue: []byte("v1"), TTL: Persistent,
+					})
+					return mcasErr
+				})
+				switch {
+				case err == nil:
+					atomic.AddInt64(&success, 1)
+				case errors.Is(err, ErrMultiCASCompareFailed):
+					atomic.AddInt64(&compareFail, 1)
+				default:
+					t.Errorf("unexpected err: %v", err)
+				}
+			}()
+		}
+		wg2.Wait()
+		r.Equal(int64(1), success)
+		r.Equal(int64(1), compareFail)
+	})
+}
+
+// TestTx_MultiCompareAndSwap_DiskBackedValue verifies comparison against
+// values that are not resident in the RAM index and must be loaded from disk.
+func TestTx_MultiCompareAndSwap_DiskBackedValue(t *testing.T) {
+	withRAMIdxDB(t, func(t *testing.T, db *DB) {
+		r := require.New(t)
+		bucket := "mcas_bucket"
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+		txPut(t, db, bucket, []byte("k1"), []byte("disk-value"), Persistent, nil, nil)
+
+		r.NoError(db.Update(func(tx *Tx) error {
+			failed, err := tx.MultiCompareAndSwap(MultiCASItem{
+				Bucket: bucket, Key: []byte("k1"), ExpectExists: true, ExpectValue: []byte("disk-value"),
+				Action: MCASActionReplace, NewValue: []byte("ram-now"), TTL: Persistent,
+			})
+			r.Equal(-1, failed)
+			return err
+		}))
+		txGet(t, db, bucket, []byte("k1"), []byte("ram-now"), nil)
 	})
 }

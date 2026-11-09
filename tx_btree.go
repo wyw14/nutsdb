@@ -15,6 +15,7 @@
 package nutsdb
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"math/big"
@@ -759,4 +760,313 @@ func (tx *Tx) loadValue(
 		return pendingEntry.Value, pendingEntry.Meta.TTL, nil
 	}
 	return rec.Value, rec.TTL, nil
+}
+
+// MCASAction represents the action applied to a MultiCASItem after every
+// expectation of the MultiCompareAndSwap call has matched.
+type MCASAction uint8
+
+const (
+	// MCASActionReplace replaces the value of the key. The explicit TTL field
+	// of the item is used, where Persistent (zero) means the new value never
+	// expires.
+	MCASActionReplace MCASAction = iota
+
+	// MCASActionDelete deletes the key.
+	MCASActionDelete
+
+	// MCASActionReplaceKeepTTL replaces the value of the key while preserving
+	// its original absolute expiration deadline (timestamp + TTL) instead of
+	// refreshing the remaining lifetime.
+	MCASActionReplaceKeepTTL
+)
+
+// MultiCASItem describes one compare-and-swap element of a
+// MultiCompareAndSwap batch.
+//
+// ExpectExists and ExpectValue are independent: a missing key is expressed by
+// ExpectExists=false rather than by a nil ExpectValue, and an existing key may
+// legitimately carry a zero-length value, which compares successfully against
+// an empty (or nil) ExpectValue. ExpectValue is only consulted when
+// ExpectExists is true.
+type MultiCASItem struct {
+	// Bucket is the BTree bucket the key belongs to.
+	Bucket string
+
+	// Key is the key to compare and to apply the action to.
+	Key []byte
+
+	// ExpectExists states whether the key is expected to exist. Expired keys
+	// count as non-existent.
+	ExpectExists bool
+
+	// ExpectValue is the expected byte value. It is only compared when
+	// ExpectExists is true.
+	ExpectValue []byte
+
+	// Action is the write applied to the key after all expectations match.
+	Action MCASAction
+
+	// NewValue is the replacement value for MCASActionReplace and
+	// MCASActionReplaceKeepTTL. It may be zero-length. It is ignored (and must
+	// be left empty) for MCASActionDelete.
+	NewValue []byte
+
+	// TTL is the explicit new TTL in seconds for MCASActionReplace, where zero
+	// means Persistent. It must stay zero for the delete and KeepTTL actions.
+	TTL uint32
+}
+
+// mcasBucketKey identifies a unique bucket/key pair inside one batch.
+type mcasBucketKey struct {
+	bucket string
+	key    string
+}
+
+// mcasPlan is a fully validated, ready-to-submit write produced by the
+// read-only phase of MultiCompareAndSwap.
+type mcasPlan struct {
+	bucket string
+	entry  *core.Entry
+}
+
+// mcasExpiredAt reports whether a record with the given TTL (seconds) and
+// timestamp (milliseconds) is expired at the captured nowMillis moment. It
+// mirrors ttl.Checker.IsExpired, including the boundary rule that the record
+// expires exactly when now reaches timestamp + ttl*1000.
+func mcasExpiredAt(nowMillis int64, ttl uint32, timestamp uint64) bool {
+	if ttl == Persistent {
+		return false
+	}
+	return nowMillis >= int64(timestamp)+int64(ttl)*1000
+}
+
+// mcasRead resolves the current state of a key as of the captured nowMillis
+// moment. Pending writes of this transaction take precedence over the
+// committed index, and every record, including pending ones, is checked for
+// expiration against the same captured moment. It never triggers lazy
+// expiration callbacks. The returned value is only meaningful when exists is
+// true.
+func (tx *Tx) mcasRead(bucket *core.Bucket, key []byte, nowMillis int64) (exists bool, value []byte, ttl uint32, timestamp uint64, err error) {
+	status, pendingEntry := tx.findEntryAndItsStatus(DataStructureBTree, bucket.Name, string(key))
+	switch status {
+	case EntryDeleted:
+		return false, nil, 0, 0, nil
+	case EntryUpdated:
+		if mcasExpiredAt(nowMillis, pendingEntry.Meta.TTL, pendingEntry.Meta.Timestamp) {
+			return false, nil, 0, 0, nil
+		}
+		return true, pendingEntry.Value, pendingEntry.Meta.TTL, pendingEntry.Meta.Timestamp, nil
+	}
+
+	idx, bucketExists := tx.db.Index.BTree.exist(bucket.Id)
+	if !bucketExists {
+		return false, nil, 0, 0, nil
+	}
+
+	// FindForVerification does not fire expiration callbacks, so a failed
+	// comparison leaves the database state untouched.
+	record, found := idx.FindForVerification(key)
+	if !found {
+		return false, nil, 0, 0, nil
+	}
+	if mcasExpiredAt(nowMillis, record.TTL, record.Timestamp) {
+		return false, nil, 0, 0, nil
+	}
+
+	value, err = tx.db.getValueByRecord(record)
+	if err != nil {
+		return false, nil, 0, 0, err
+	}
+	return true, value, record.TTL, record.Timestamp, nil
+}
+
+// validateMultiCASItem checks the structural validity and option consistency
+// of one item. It runs before any state read, so option conflicts are reported
+// before expectation mismatches.
+func validateMultiCASItem(item MultiCASItem) error {
+	if len(item.Key) == 0 {
+		return ErrKeyEmpty
+	}
+
+	switch item.Action {
+	case MCASActionReplace:
+		// Any TTL (including Persistent) and any value length, including zero,
+		// are accepted.
+		return nil
+	case MCASActionDelete:
+		if !item.ExpectExists {
+			return ErrMultiCASOptionConflict
+		}
+		if len(item.NewValue) > 0 {
+			return ErrMultiCASOptionConflict
+		}
+		if item.TTL != 0 {
+			return ErrMultiCASOptionConflict
+		}
+		return nil
+	case MCASActionReplaceKeepTTL:
+		if !item.ExpectExists {
+			return ErrMultiCASNoTTLToKeep
+		}
+		if item.TTL != 0 {
+			return ErrMultiCASOptionConflict
+		}
+		return nil
+	default:
+		return ErrMultiCASInvalidAction
+	}
+}
+
+// buildMCASEntry constructs the pending entry for an already validated item.
+// Keys and replacement values are copied defensively, so mutating the caller's
+// slices after MultiCompareAndSwap returns cannot alter the pending result.
+func (tx *Tx) buildMCASEntry(item MultiCASItem, bucketId core.BucketId, nowMillis int64, oldTTL uint32, oldTimestamp uint64) *core.Entry {
+	keyCopy := append([]byte(nil), item.Key...)
+
+	var (
+		flag      uint16
+		valueCopy []byte
+		ttl       uint32
+		timestamp uint64
+	)
+
+	switch item.Action {
+	case MCASActionDelete:
+		flag = DataDeleteFlag
+		ttl = Persistent
+		timestamp = uint64(nowMillis)
+	case MCASActionReplaceKeepTTL:
+		flag = DataSetFlag
+		valueCopy = append([]byte(nil), item.NewValue...)
+		// Reusing the original timestamp and TTL preserves the exact absolute
+		// deadline (timestamp + TTL) instead of restarting the remaining TTL.
+		ttl = oldTTL
+		timestamp = oldTimestamp
+	default: // MCASActionReplace
+		flag = DataSetFlag
+		valueCopy = append([]byte(nil), item.NewValue...)
+		ttl = item.TTL
+		timestamp = uint64(nowMillis)
+	}
+
+	meta := core.NewMetaData().WithTimeStamp(timestamp).
+		WithKeySize(uint32(len(keyCopy))).
+		WithValueSize(uint32(len(valueCopy))).
+		WithFlag(flag).
+		WithTTL(ttl).
+		WithStatus(UnCommitted).
+		WithDs(DataStructureBTree).
+		WithTxID(tx.id).
+		WithBucketId(bucketId)
+
+	return core.NewEntry().WithKey(keyCopy).WithMeta(meta).WithValue(valueCopy)
+}
+
+// MultiCompareAndSwap atomically compares a batch of bucket/key expectations
+// and, only when every expectation matches, adds all replacement actions to
+// the current transaction in one shot.
+//
+// The call is strictly two-phase: it first validates every item and evaluates
+// every expectation without touching transaction state, and only then submits
+// the prepared entries. Consequently any validation failure, duplicate
+// bucket/key, missing bucket, transaction-size limit breach or expectation
+// mismatch leaves the pending entries, tx.size and bucket records exactly as
+// they were before the call, and the transaction remains usable.
+//
+// All expiration decisions use a single TTL service moment captured when the
+// call starts; expired keys are treated as non-existent. Comparison reads see
+// the Put/Delete operations already performed inside this transaction.
+//
+// On an expectation mismatch it returns the actual failing input position
+// together with ErrMultiCASCompareFailed; success returns (-1, nil). Other
+// failures return -1 together with the concrete error. An empty batch is a
+// no-op and returns (-1, nil).
+//
+// MultiCompareAndSwap only works on writable transactions, relies on the
+// existing database write lock for concurrency control and does not change any
+// single-key API.
+func (tx *Tx) MultiCompareAndSwap(items ...MultiCASItem) (failedIndex int, err error) {
+	if err = tx.checkTxIsClosed(); err != nil {
+		return -1, err
+	}
+	// An empty batch is a no-op regardless of the transaction mode, mirroring
+	// the behavior of MSet with no arguments.
+	if len(items) == 0 {
+		return -1, nil
+	}
+	if !tx.writable {
+		return -1, ErrTxNotWritable
+	}
+
+	// One TTL service moment for the whole batch: every key is judged against
+	// the same now value, including keys that are already pending in this tx.
+	nowMillis := tx.db.ttlService.NowMillis()
+
+	seen := make(map[mcasBucketKey]struct{}, len(items))
+	plans := make([]mcasPlan, 0, len(items))
+
+	// Phase 1: validate, read and compare without mutating any tx state.
+	projectedSize := tx.size
+	projectedCount := tx.pendingWrites.size
+
+	for i, item := range items {
+		if err = validateMultiCASItem(item); err != nil {
+			return -1, err
+		}
+
+		keyIdentity := mcasBucketKey{bucket: item.Bucket, key: string(item.Key)}
+		if _, duplicated := seen[keyIdentity]; duplicated {
+			return -1, ErrMultiCASDuplicateKey
+		}
+		seen[keyIdentity] = struct{}{}
+
+		bucketStatus, bucket := tx.getBucketAndItsStatus(DataStructureBTree, item.Bucket)
+		if isBucketNotFoundStatus(bucketStatus) {
+			return -1, ErrBucketNotFound
+		}
+
+		exists, currentValue, oldTTL, oldTimestamp, readErr := tx.mcasRead(bucket, item.Key, nowMillis)
+		if readErr != nil {
+			return -1, readErr
+		}
+
+		if exists != item.ExpectExists {
+			return i, ErrMultiCASCompareFailed
+		}
+		// Value comparison only applies to keys expected to exist, so an empty
+		// value is never serialized as a missing key.
+		if exists && !bytes.Equal(currentValue, item.ExpectValue) {
+			return i, ErrMultiCASCompareFailed
+		}
+
+		entry := tx.buildMCASEntry(item, bucket.Id, nowMillis, oldTTL, oldTimestamp)
+		if err = entry.Valid(); err != nil {
+			return -1, err
+		}
+
+		_, alreadyPending := tx.pendingWrites.entriesInBTree[item.Bucket][string(item.Key)]
+		if !alreadyPending {
+			projectedCount++
+		}
+		projectedSize += entry.Size()
+
+		plans = append(plans, mcasPlan{bucket: item.Bucket, entry: entry})
+	}
+
+	// Mirror Tx.checkSize before any write, so breaching the transaction
+	// limits cannot leave a partially applied batch behind.
+	if int64(projectedCount) >= tx.db.getMaxBatchCount() || projectedSize >= tx.db.getMaxBatchSize() {
+		return -1, ErrTxnTooBig
+	}
+
+	// Phase 2: every entry is fully built and validated, and submitEntry is a
+	// non-failing map assignment, so this loop cannot fail halfway: either all
+	// actions become pending or none of them do.
+	for _, plan := range plans {
+		tx.submitEntry(DataStructureBTree, plan.bucket, plan.entry)
+		tx.size += plan.entry.Size()
+	}
+
+	return -1, nil
 }
